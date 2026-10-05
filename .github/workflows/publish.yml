@@ -1,0 +1,147 @@
+name: CI and release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    name: Ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
+      - run: python -m pip install --upgrade ruff
+      - run: ruff check .
+
+  build:
+    name: Version, build and check
+    needs: lint
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release: ${{ steps.changes.outputs.release }}
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Did the package change?
+        id: changes
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          # First push to a branch has no usable "before" commit.
+          if ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$BEFORE" "$GITHUB_SHA" | grep -Eq '^(src/|pyproject\.toml$)'; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v7
+        if: steps.changes.outputs.release == 'true'
+        with:
+          python-version: "3.x"
+
+      - name: Pick the version, bumping the patch if it is already on PyPI
+        id: version
+        if: steps.changes.outputs.release == 'true'
+        run: |
+          file=src/claude_artifact_cli/__init__.py
+          version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$file")
+          status=$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/claude-artifact-cli/$version/json")
+          if [ "$status" = "200" ]; then
+            IFS=. read -r major minor patch <<< "$version"
+            version="$major.$minor.$((patch + 1))"
+            sed -i "s/^__version__ = \".*\"/__version__ = \"$version\"/" "$file"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -am "chore(release): v$version [skip ci]"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build sdist and wheel
+        if: steps.changes.outputs.release == 'true'
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          python -m twine check --strict dist/*
+
+      - name: Smoke test the wheel
+        if: steps.changes.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install dist/*.whl
+          /tmp/smoke/bin/claude-artifact --help
+          /tmp/smoke/bin/claude-artifact publish --help
+          test "$(/tmp/smoke/bin/python -c 'import claude_artifact_cli; print(claude_artifact_cli.__version__)')" = "$VERSION"
+
+      - uses: actions/upload-artifact@v7
+        if: steps.changes.outputs.release == 'true'
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    if: needs.build.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/claude-artifact-cli/${{ needs.build.outputs.version }}/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: Tag and GitHub release
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create tag and release with built files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.build.outputs.version }}
+          SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
+            --title "$TAG" \
+            --generate-notes

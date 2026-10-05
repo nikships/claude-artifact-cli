@@ -1,0 +1,70 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claude-artifact-cli"
+dynamic = ["version"]
+description = "Publish, update, list and inspect Claude Artifacts from the terminal, using the Claude Code login already on your machine."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Nik", email = "nik.anand.1998@gmail.com" }]
+keywords = [
+    "claude",
+    "claude-code",
+    "claude-artifacts",
+    "artifacts",
+    "anthropic",
+    "cli",
+    "command-line",
+    "terminal",
+    "publish",
+    "html",
+    "ai",
+    "llm",
+    "agent-skill",
+    "developer-tools",
+    "automation",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/nikships/claude-artifact-cli"
+Repository = "https://github.com/nikships/claude-artifact-cli"
+Issues = "https://github.com/nikships/claude-artifact-cli/issues"
+Releases = "https://github.com/nikships/claude-artifact-cli/releases"
+
+[project.scripts]
+claude-artifact = "claude_artifact_cli.cli:main"
+
+[tool.hatch.version]
+path = "src/claude_artifact_cli/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_artifact_cli"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
