@@ -18,7 +18,7 @@ Publish, update, list and inspect Claude Artifacts from the terminal, using the 
 
 `claude-artifact` publishes an HTML page (plus any CSS, JS and images it uses) as a [Claude Artifact](https://claude.ai/code/artifacts) and prints the link. It talks to the same API the Claude Code `Artifact` tool uses and reuses the claude.ai login from `claude /login`. No API key, no config file, no dependencies beyond Python 3.10+.
 
-Use it where the built-in tool can't reach: shell scripts, Makefiles, git hooks, CI jobs, subagents and other coding agents.
+Use it where the built-in tool can't reach: other coding agents (Droid, Codex, Cursor, OpenCode), subagents, shell scripts, Makefiles, git hooks and CI jobs.
 
 > [!NOTE]
 > Unofficial and not affiliated with Anthropic. It uses a private, undocumented API that can change or break without notice.
@@ -108,12 +108,12 @@ It must be the **claude.ai OAuth token** from `claude /login`. The artifacts rou
 
 ## Agent skill
 
-[`skills/claude-artifact-cli/SKILL.md`](skills/claude-artifact-cli/SKILL.md) teaches Claude Code, Droid, Codex and other agents when and how to use the CLI. Install it for Claude Code:
+[`skills/claude-artifact-cli/SKILL.md`](skills/claude-artifact-cli/SKILL.md) teaches any coding agent (Droid, Codex, Cursor, OpenCode, Claude Code subagents) when and how to use the CLI. Install it in the shared agent skills directory:
 
 ```bash
-mkdir -p ~/.claude/skills/claude-artifact-cli
+mkdir -p ~/.agents/skills/claude-artifact-cli
 curl -fsSL https://raw.githubusercontent.com/nikships/claude-artifact-cli/main/skills/claude-artifact-cli/SKILL.md \
-  -o ~/.claude/skills/claude-artifact-cli/SKILL.md
+  -o ~/.agents/skills/claude-artifact-cli/SKILL.md
 ```
 
 ## Troubleshooting
