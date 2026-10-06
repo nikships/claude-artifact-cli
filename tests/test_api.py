@@ -230,14 +230,19 @@ class WireTest(ApiCase):
         big = api.Asset("big.png", b"\x00" * 64, "image/png")
         server = self.serve(
             {
-                ("POST", "/api/frame/deploy/prepare"): {"slug": "s1", "missing": [big.sha256]},
+                ("POST", "/api/frame/deploy/prepare"): {
+                    "slug": "s1",
+                    "missing": [big.sha256, page().sha256],
+                },
                 ("POST", "/api/frame/upload"): {},
                 DEPLOY: {"slug": "s1"},
             }
         )
         with mock.patch.object(api, "INLINE_BUDGET", 10):
             self.client().publish(page(), extra=[big], slug="s1", base_version="v1")
-        self.assertEqual(server.body("POST", "/api/frame/deploy/prepare")["slug"], "s1")
+        prep = server.body("POST", "/api/frame/deploy/prepare")
+        self.assertEqual(prep["slug"], "s1")
+        self.assertEqual(prep["shas"], [big.sha256])  # the page is never staged
         upload = server.body("POST", "/api/frame/upload")
         self.assertEqual([f["path"] for f in upload["files"]], ["big.png"])
         manifest = server.body()["manifest"]
@@ -253,7 +258,7 @@ class WireTest(ApiCase):
             }
         )
         with mock.patch.object(api, "INLINE_BUDGET", 10):
-            self.client().publish(page())
+            self.client().publish(page(), extra=[api.Asset("big.png", b"\x00" * 64, "image/png")])
         self.assertEqual(server.body()["mode"], "replace")
         self.assertNotIn(boot_path("fresh"), server.paths())
 

@@ -263,11 +263,13 @@ class FrameClient:
         total = sum(a.wire_bytes() for a in assets)
         staged: list[Asset] = []
 
-        if total > INLINE_BUDGET:
+        # The server takes the page only as inline content, so only the
+        # supporting files can be staged by hash.
+        if total > INLINE_BUDGET and extra:
             on_progress(
                 f"body is {total // 1024 // 1024} MB - using prepare/upload flow"
             )
-            slug, staged = self._stage(assets, slug, on_progress)
+            slug, staged = self._stage(assets[1:], slug, on_progress)
 
         staged_paths = {a.path for a in staged}
         for asset in assets:
