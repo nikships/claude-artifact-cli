@@ -50,9 +50,14 @@ is missing:
 uv tool install claude-artifact-cli
 # or, without installing:
 uvx --from claude-artifact-cli claude-artifact whoami
-# upgrade an existing install:
-uv tool upgrade claude-artifact-cli
+# upgrade an existing install now:
+claude-artifact update
 ```
+
+A uv tool or pipx install also upgrades itself in the background, at most once a
+day, when a command finds a newer release (a line on stderr says so). Set
+`CLAUDE_ARTIFACT_NO_AUTO_UPDATE=1` to only be told, or
+`CLAUDE_ARTIFACT_NO_UPDATE_CHECK=1` to skip the check.
 
 Never echo the token itself, and never pass it on a command line that gets logged.
 

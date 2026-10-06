@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -11,7 +12,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import api, auth
+from . import __version__, api, auth, update
 
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
@@ -577,6 +578,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Publish Claude Artifacts from the command line, "
         "using the Claude Code login already on this machine.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--token", help="bearer token (default: read from Keychain)")
     parser.add_argument("--base", default=api.DEFAULT_BASE, help=argparse.SUPPRESS)
     parser.add_argument("--json", action="store_true", help="raw JSON output")
@@ -666,6 +668,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--url", help="artifact URL to compare with")
     p.set_defaults(func=cmd_status)
 
+    p = sub.add_parser("update", help="upgrade this CLI to the latest release now")
+    p.set_defaults(func=update.cmd_update)
+
     p = sub.add_parser("whoami", parents=[common], help="check that auth works")
     p.set_defaults(func=cmd_whoami)
 
@@ -674,6 +679,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # Updating is best effort: no problem with it may stop or change a command.
+    check = None
+    if args.command != "update":
+        with contextlib.suppress(Exception):
+            check = update.start_check()
+    try:
+        return _run(args)
+    finally:
+        with contextlib.suppress(Exception):
+            update.finish_check(check, quiet=getattr(args, "quiet", False))
+
+
+def _run(args) -> int:
     try:
         return args.func(args)
     except auth.AuthError as exc:
