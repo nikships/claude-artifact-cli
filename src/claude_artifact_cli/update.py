@@ -58,12 +58,16 @@ def is_newer(latest, current) -> bool:
 
 
 def install_kind() -> str:
-    """How this copy was installed: "uv", "pipx" or "pip"."""
+    """How this copy was installed: "uv", "pipx" or "pip".
+
+    uv and pipx leave a marker in every environment they manage, wherever it
+    lives (a custom UV_TOOL_DIR, %APPDATA%\\uv\\data\\tools on Windows).
+    """
     prefix = os.path.realpath(sys.prefix)
     sep = os.sep
-    if f"{sep}uv{sep}tools{sep}" in prefix:
+    if os.path.exists(os.path.join(prefix, "uv-receipt.toml")) or f"{sep}uv{sep}tools{sep}" in prefix:
         return "uv"
-    if f"{sep}pipx{sep}" in prefix:
+    if os.path.exists(os.path.join(prefix, "pipx_metadata.json")) or f"{sep}pipx{sep}" in prefix:
         return "pipx"
     return "pip"
 
@@ -87,6 +91,14 @@ def _enabled() -> bool:
 
 def _auto_enabled() -> bool:
     return not os.environ.get("CLAUDE_ARTIFACT_NO_AUTO_UPDATE") and install_kind() != "pip"
+
+
+def _number(value) -> float:
+    """A timestamp from the state file, or 0 if it isn't one."""
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _load_state() -> dict:
@@ -124,11 +136,15 @@ def start_check() -> dict | None:
     if not _enabled():
         return None
     state = _load_state()
-    latest = state.get("latest") or ""
-    checked = float(state.get("checked_at") or 0)
-    holder: dict = {"latest": latest or None, "thread": None, "state": state}
-    if latest and time.time() - checked < CHECK_INTERVAL:
+    latest = state.get("latest") if isinstance(state.get("latest"), str) else ""
+    holder: dict = {"latest": latest or None, "thread": None}
+    # A recent check, or a failed one less than an hour ago, answers for now.
+    if time.time() - _number(state.get("checked_at")) < CHECK_INTERVAL:
         return holder
+    # Count the attempt before it starts: a fetch still running when the
+    # command exits is abandoned, and must not make the next command retry.
+    retry_at = time.time() - CHECK_INTERVAL + FAIL_BACKOFF
+    _save_state({**state, "checked_at": retry_at, "latest": latest})
 
     def work() -> None:
         try:
@@ -136,10 +152,7 @@ def start_check() -> dict | None:
             holder["latest"] = found
             _save_state({**state, "checked_at": time.time(), "latest": found})
         except (OSError, ValueError, KeyError, TypeError, http.client.HTTPException):
-            # Offline or a PyPI blip: try again in an hour, keep any known version.
-            _save_state(
-                {**state, "checked_at": time.time() - CHECK_INTERVAL + FAIL_BACKOFF, "latest": latest}
-            )
+            pass  # offline or a PyPI blip: the attempt saved above retries in an hour
 
     thread = threading.Thread(target=work, daemon=True)
     holder["thread"] = thread
@@ -157,14 +170,16 @@ def finish_check(holder: dict | None, quiet: bool = False) -> None:
     latest = holder.get("latest")
     if not is_newer(latest, __version__):
         return
-    if _auto_enabled():
-        if _start_upgrade(latest) and not quiet:
+    if _auto_enabled() and _start_upgrade(latest):
+        if not quiet:
             print(
                 f"\n{PACKAGE} {__version__} → {latest}: updating in the background "
                 f"(log: {LOG_FILE})",
                 file=sys.stderr,
             )
         return
+    # No upgrade started (a pip install, opted out, the tool missing, or
+    # today's attempt didn't take): say so instead.
     if not quiet:
         print(
             f"\nA new release of {PACKAGE} is available: {__version__} → {latest}\n"
@@ -178,7 +193,7 @@ def _start_upgrade(latest: str) -> bool:
     state = _load_state()
     if (
         state.get("upgrade_to") == latest
-        and time.time() - float(state.get("upgrade_started_at") or 0) < CHECK_INTERVAL
+        and time.time() - _number(state.get("upgrade_started_at")) < CHECK_INTERVAL
     ):
         return False
     argv = upgrade_argv()

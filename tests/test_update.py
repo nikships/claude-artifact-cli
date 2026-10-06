@@ -85,6 +85,18 @@ class InstallKindTest(UpdateCase):
                 self.assertEqual(update.upgrade_argv(), argv)
 
 
+class InstallMarkerTest(UpdateCase):
+    def test_markers_win_over_paths(self):
+        with tempfile.TemporaryDirectory() as env:
+            with mock.patch.object(update.sys, "prefix", env):
+                self.assertEqual(update.install_kind(), "pip")
+                Path(env, "uv-receipt.toml").write_text("")
+                self.assertEqual(update.install_kind(), "uv")
+            with tempfile.TemporaryDirectory() as env2, mock.patch.object(update.sys, "prefix", env2):
+                Path(env2, "pipx_metadata.json").write_text("{}")
+                self.assertEqual(update.install_kind(), "pipx")
+
+
 class CheckTest(UpdateCase):
     def test_off_in_ci_and_when_opted_out(self):
         for key in ("CI", "CLAUDE_ARTIFACT_NO_UPDATE_CHECK"):
@@ -103,6 +115,35 @@ class CheckTest(UpdateCase):
         self.state_file.write_text(json.dumps({"latest": "1.0.0", "checked_at": 0}))
         self.run_check()
         self.assertEqual(self.fetch.call_count, 1)
+
+    def test_failed_first_check_still_backs_off(self):
+        self.fetch.side_effect = OSError("offline")
+        self.run_check()
+        self.run_check()
+        self.assertEqual(self.fetch.call_count, 1)
+
+    def test_abandoned_fetch_counts_as_an_attempt(self):
+        # The attempt is on disk before the thread runs, so a fetch killed at
+        # exit still waits an hour before the next one.
+        seen = {}
+        self.fetch.side_effect = lambda: seen.setdefault("state", self.state()) and "1.0.0"
+        self.run_check()
+        age = time.time() - seen["state"]["checked_at"]
+        self.assertAlmostEqual(age, update.CHECK_INTERVAL - update.FAIL_BACKOFF, delta=60)
+
+    def test_corrupt_state_values_are_ignored(self):
+        for bad in ("x", [], {"a": 1}, [1]):
+            with self.subTest(bad=bad):
+                self.state_file.write_text(
+                    json.dumps(
+                        {"checked_at": bad, "latest": bad, "upgrade_to": "1.1.0",
+                         "upgrade_started_at": bad}
+                    )
+                )
+                self.fetch.reset_mock()
+                self.fetch.return_value = "1.1.0"
+                self.run_check(quiet=True)
+                self.fetch.assert_called_once()
 
     def test_fetch_failure_is_silent_and_backs_off_an_hour(self):
         self.fetch.side_effect = OSError("offline")
@@ -160,11 +201,17 @@ class AutoUpdateTest(UpdateCase):
         self.assertEqual(self.run_check(quiet=True), "")
         self.popen.assert_called_once()
 
-    def test_missing_tool_skips_the_upgrade(self):
+    def test_missing_tool_falls_back_to_the_notice(self):
         self.fetch.return_value = "1.1.0"
         with mock.patch.object(update.shutil, "which", return_value=None):
-            self.assertEqual(self.run_check(), "")
+            self.assertIn("is available: 1.0.0 → 1.1.0", self.run_check())
         self.popen.assert_not_called()
+
+    def test_attempt_already_made_today_falls_back_to_the_notice(self):
+        self.fetch.return_value = "1.1.0"
+        self.run_check()
+        self.assertIn("is available: 1.0.0 → 1.1.0", self.run_check())
+        self.popen.assert_called_once()
 
     def test_nothing_when_current(self):
         self.fetch.return_value = "1.0.0"
@@ -200,6 +247,16 @@ class CliTest(UpdateCase):
         self.assertEqual(out.getvalue(), "No artifacts.\n")
         self.assertIn("updating in the background", err.getvalue())
         self.popen.assert_called_once()
+
+    def test_a_crashing_check_never_stops_the_command(self):
+        self.patch(update, "start_check", side_effect=TypeError("boom"))
+        self.patch(update, "finish_check", side_effect=TypeError("boom"))
+        self.patch(cli.auth, "get_token", return_value="test-token")
+        self.patch(cli.api.FrameClient, "_request", return_value=[])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(["list"]), 0)
+        self.assertEqual(out.getvalue(), "No artifacts.\n")
 
     def test_a_broken_state_dir_never_fails_the_command(self):
         self.fetch.return_value = "1.1.0"

@@ -679,12 +679,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    check = None if args.command == "update" else update.start_check()
+    # Updating is best effort: no problem with it may stop or change a command.
+    check = None
+    if args.command != "update":
+        with contextlib.suppress(Exception):
+            check = update.start_check()
     try:
         return _run(args)
     finally:
-        # An update problem never changes the command's outcome.
-        with contextlib.suppress(OSError, ValueError):
+        with contextlib.suppress(Exception):
             update.finish_check(check, quiet=getattr(args, "quiet", False))
 
 
