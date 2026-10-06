@@ -16,7 +16,7 @@ Zero-dependency Python CLI (`claude-artifact`) for Anthropic's private Claude Ar
 
 ```bash
 uvx ruff check .                                        # the only CI lint gate
-PYTHONPATH=src python -m unittest discover -s tests -v  # unit tests; run in CI
+PYTHONPATH=src python -m unittest discover -s tests -v  # unit tests; CI runs them on Linux, macOS, Windows x Python 3.10, latest
 uv build && uvx twine check --strict dist/*             # packaging check
 uv run --with . claude-artifact --help                  # smoke test
 uv run --with . claude-artifact whoami                  # live auth check; needs `claude /login`
@@ -41,7 +41,7 @@ Validate changes with ruff, the unit tests, a build, and `--help` on affected su
 
 ## Releases
 
-Every push to `main` that touches `src/` or `pyproject.toml` releases automatically:
+Every push to `main` that touches `src/` or `pyproject.toml` releases automatically, once Ruff and the test matrix pass:
 
 1. If `__version__` is not on PyPI yet, CI publishes it as-is. Otherwise CI bumps the patch, commits `chore(release): vX.Y.Z [skip ci]` to `main`, and publishes that.
 2. Publishing uses PyPI trusted publishing (environment `pypi`, workflow `publish.yml`). No tokens.
