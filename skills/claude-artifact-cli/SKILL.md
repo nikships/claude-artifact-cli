@@ -1,19 +1,16 @@
 ---
 name: claude-artifact-cli
 description: >-
-  Publish, update, read, pull, list and inspect Claude Artifacts from a shell
-  with the `claude-artifact` CLI, using the Claude Code login already on the
-  machine. Use when publishing an artifact from a script, a Makefile, a git
-  hook, CI, a non-interactive session, or a subagent without the Artifact tool;
-  when the user says "claude-artifact", "publish it from the terminal", or asks
-  to script or automate artifact publishing; when updating an existing artifact
-  by slug or URL (claude.ai/code/artifact/… or claude.ai/artifact/…); when
-  reading an artifact's files or pulling one into a directory to edit it; when
-  publishing a directory or checking whether a local copy matches what is live
-  (`claude-artifact status`); or when listing or inspecting artifacts from the
-  command line. Never WebFetch or curl a claude.ai artifact URL to read it: it
-  returns no page content; use `claude-artifact read SLUG --path index.html` or
-  `claude-artifact pull`. Prefer the built-in Artifact tool for ordinary
+  Publish, update, read, pull and list Claude Artifacts from a shell with the
+  `claude-artifact` CLI, using the Claude Code login already on the machine.
+  Use when publishing from a script, Makefile, git hook, CI, or a subagent
+  without the Artifact tool; when the user says "claude-artifact" or asks to
+  script artifact publishing; when updating an artifact by slug or URL
+  (claude.ai/artifact/… or claude.ai/code/artifact/…); when reading an
+  artifact's files, pulling one into a directory to edit, or checking a local
+  copy against what is live. Never WebFetch or curl a claude.ai artifact URL:
+  it returns no page content; use `claude-artifact read SLUG --path index.html`
+  or `claude-artifact pull`. Prefer the built-in Artifact tool for ordinary
   interactive publishing.
 metadata:
   source: https://github.com/nikships/claude-artifact-cli (PyPI claude-artifact-cli)
