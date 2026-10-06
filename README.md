@@ -51,6 +51,8 @@ claude-artifact read SLUG_OR_URL [-o FILE]  metadata + published file manifest
 claude-artifact read SLUG_OR_URL --path P [--path P ... --out-dir DIR]
                                             a published file's exact bytes
 claude-artifact whoami                      check that auth works
+claude-artifact update                      upgrade to the latest release now
+claude-artifact --version
 ```
 
 The URL goes to stdout and progress goes to stderr, so `URL=$(claude-artifact publish page.html -q)` captures only the link. Add `--json` to `publish`, `status`, `list` or `read` for raw output. Exit codes: `0` success, `1` API error, `2` auth error, `3` version conflict (HTTP 409), `130` interrupted.
@@ -195,6 +197,19 @@ claude-artifact read <slug> --path index.html --path app.css --out-dir ./out   #
 `read --path P` prints the published file's exact bytes to stdout instead, checked against the manifest's sha256. Repeat `--path` with `--out-dir DIR` to save several files under `DIR` at their published paths; it prints each saved path. `--path` doesn't combine with `--json` or `-o`, more than one `--path` needs `--out-dir`, and `--out-dir` needs `--path`.
 
 Never WebFetch or curl a `claude.ai` artifact URL: it is a login-walled app shell and returns no page content.
+
+## Updates
+
+A uv tool or pipx install keeps itself current. At most once a day, a command checks PyPI in the background (2-second timeout, never in CI). When a newer release is out, it starts `uv tool upgrade claude-artifact-cli` (or `pipx upgrade claude-artifact-cli`) in a detached process after the command finishes and says so on stderr; `-q` keeps that quiet. The upgrade's output goes to `~/.config/claude-artifact-cli/update.log`. A plain pip install isn't changed behind your back: it prints a notice instead. A failed check or upgrade never changes the command's output or exit code.
+
+```bash
+claude-artifact update     # upgrade now, in the foreground
+```
+
+| Variable | Effect |
+|----------|--------|
+| `CLAUDE_ARTIFACT_NO_AUTO_UPDATE=1` | Check and print a notice, but never upgrade. |
+| `CLAUDE_ARTIFACT_NO_UPDATE_CHECK=1` | No check at all. `CI` set does the same. |
 
 ## Auth
 
@@ -356,7 +371,8 @@ src/
     ├── __main__.py          python -m claude_artifact_cli
     ├── api.py               frame API client
     ├── auth.py              token lookup
-    └── cli.py               argparse entry point
+    ├── cli.py               argparse entry point
+    └── update.py            daily update check, background upgrade, `update`
 tests/                       unit tests (offline; transport mocked)
 AGENTS.md
 LICENSE
