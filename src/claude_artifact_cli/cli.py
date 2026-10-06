@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -11,6 +13,12 @@ from pathlib import Path
 from . import api, auth
 
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+
+# Written into a published directory so the next publish of it updates the same
+# artifact and can detect a version someone else published in between.
+STATE_FILE = ".artifact.json"
+
+EXIT_CONFLICT = 3
 
 
 def _eprint(msg: str) -> None:
@@ -51,28 +59,92 @@ def _load_assets(specs: list[str], root: str | None) -> list[api.Asset]:
     return assets
 
 
+def _dir_files(root: Path) -> dict[str, Path]:
+    """Published path -> file for everything under root, skipping dotfiles.
+
+    Symlinks are refused rather than followed, so a link can't publish a file
+    from outside the directory.
+    """
+    files = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        here = Path(dirpath)
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        for name in [d for d in dirnames if (here / d).is_symlink()] + [
+            f for f in filenames if not f.startswith(".")
+        ]:
+            path = here / name
+            if path.is_symlink():
+                raise SystemExit(f"error: {path} is a symlink; copy the file in instead")
+            files[path.relative_to(root).as_posix()] = path
+    return dict(sorted(files.items()))
+
+
+def _load_state(root: Path) -> dict:
+    try:
+        state = json.loads((root / STATE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _save_state(root: Path, state: dict) -> None:
+    (root / STATE_FILE).write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+
+def _target_slug(args) -> str | None:
+    value = args.url or args.slug
+    return api.slug_from(value) if value else None
+
+
 # -- commands --------------------------------------------------------------
 
 
 def cmd_publish(args) -> int:
-    page_path = Path(args.file)
-    if not page_path.is_file():
-        raise SystemExit(f"error: no such file: {page_path}")
+    target = Path(args.file)
+    slug = _target_slug(args)
+    base_version = args.base_version
+    mode = args.mode
+    state_root = None
 
-    raw = page_path.read_bytes()
-    content_type = api.guess_content_type(page_path.name)
-    if content_type not in ("text/html", "text/markdown"):
-        content_type = "text/html"
-
-    page = api.Asset(path="index.html", data=raw, content_type=content_type)
-    extra = _load_assets(args.file_spec or [], args.root)
-
-    slug = api.slug_from(args.url or args.slug) if (args.url or args.slug) else None
+    if target.is_dir():
+        if args.file_spec or args.root:
+            raise SystemExit(
+                "error: --file and --root don't apply when publishing a directory; "
+                "put the files in it"
+            )
+        files = _dir_files(target)
+        if "index.html" not in files:
+            raise SystemExit(f"error: no index.html in {target}")
+        state = _load_state(target)
+        state_slug = state.get("slug")
+        if slug is None and isinstance(state_slug, str):
+            slug = state_slug
+        if base_version is None and slug is not None and slug == state_slug:
+            base_version = state.get("version")
+        # The directory is the whole artifact, so files deleted locally go too.
+        if mode is None and not args.remove:
+            mode = "replace"
+        raw = files.pop("index.html").read_bytes()
+        page = api.Asset(path="index.html", data=raw, content_type="text/html")
+        extra = [
+            api.Asset(path=pub, data=src.read_bytes(), content_type=api.guess_content_type(pub))
+            for pub, src in files.items()
+        ]
+        fallback_title = target.resolve().name
+        state_root = target
+    elif target.is_file():
+        raw = target.read_bytes()
+        content_type = api.guess_content_type(target.name)
+        if content_type not in ("text/html", "text/markdown"):
+            content_type = "text/html"
+        page = api.Asset(path="index.html", data=raw, content_type=content_type)
+        extra = _load_assets(args.file_spec or [], args.root)
+        fallback_title = target.stem
+    else:
+        raise SystemExit(f"error: no such file or directory: {target}")
 
     meta = {}
-    meta["title"] = args.title or _title_from_html(
-        raw.decode("utf-8", "replace"), page_path.stem
-    )
+    meta["title"] = args.title or _title_from_html(raw.decode("utf-8", "replace"), fallback_title)
     if args.favicon:
         meta["favicon"] = args.favicon
     elif not slug:
@@ -94,16 +166,28 @@ def cmd_publish(args) -> int:
         removals=args.remove or [],
         slug=slug,
         meta=meta,
-        mode=args.mode,
-        base_version=args.base_version,
+        mode=mode,
+        base_version=base_version,
         force=args.force,
         on_progress=progress,
     )
+    url = api.ARTIFACT_URL.format(slug=result["slug"])
+
+    if state_root is not None:
+        _save_state(
+            state_root,
+            {
+                "slug": result["slug"],
+                "url": url,
+                "version": result.get("version"),
+                "title": meta["title"],
+            },
+        )
 
     if args.json:
-        print(json.dumps(result, indent=2))
+        print(json.dumps({"url": url, **result}, indent=2))
     else:
-        print(api.ARTIFACT_URL.format(slug=result["slug"]))
+        print(url)
         if result.get("version") is not None and not args.quiet:
             _eprint(f"  version {result['version']}")
     return 0
@@ -137,6 +221,10 @@ def cmd_read(args) -> int:
     slug = api.slug_from(args.slug)
     data = _client(args).read(slug)
 
+    if args.out:
+        Path(args.out).write_text(json.dumps(data, indent=2), encoding="utf-8")
+        _eprint(f"wrote metadata to {args.out}")
+
     if args.json:
         print(json.dumps(data, indent=2))
         return 0
@@ -157,10 +245,77 @@ def cmd_read(args) -> int:
             size = f.get("size")
             size_s = f"{size:>9,}" if isinstance(size, int) else " " * 9
             print(f"    {size_s}  {f.get('contentType',''):<26} {f.get('path','')}")
+    return 0
 
-    if args.out:
-        Path(args.out).write_text(json.dumps(data, indent=2), encoding="utf-8")
-        _eprint(f"wrote metadata to {args.out}")
+
+def _compare(local: dict[str, Path], remote: list[dict]) -> list[tuple[str, str]]:
+    """(state, path) for every path on either side, sorted by path."""
+    remote_sha = {f.get("path"): f.get("sha256") for f in remote if f.get("path")}
+    rows = []
+    for path in sorted(set(local) | set(remote_sha)):
+        if path not in remote_sha:
+            rows.append(("local-only", path))
+        elif path not in local:
+            rows.append(("remote-only", path))
+        elif hashlib.sha256(local[path].read_bytes()).hexdigest() == remote_sha[path]:
+            rows.append(("same", path))
+        else:
+            rows.append(("changed", path))
+    return rows
+
+
+def cmd_status(args) -> int:
+    target = Path(args.path)
+    slug = _target_slug(args)
+    state: dict = {}
+
+    if target.is_dir():
+        state = _load_state(target)
+        local = _dir_files(target)
+    elif target.is_file():
+        # A single page stands in for index.html; other remote files have no
+        # local counterpart to compare against.
+        local = {"index.html": target}
+    else:
+        raise SystemExit(f"error: no such file or directory: {target}")
+
+    if slug is None:
+        slug = state.get("slug") if isinstance(state.get("slug"), str) else None
+    if slug is None:
+        raise SystemExit(
+            f"error: no artifact to compare with - pass --slug/--url, or publish {target} first"
+        )
+
+    data = _client(args).read(slug)
+    live = data.get("ver")
+    base = state.get("version") if state.get("slug") == slug else None
+    rows = _compare(local, data.get("files") or [])
+    if target.is_file():
+        rows = [r for r in rows if r[0] != "remote-only"]
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "slug": slug,
+                    "url": api.ARTIFACT_URL.format(slug=slug),
+                    "live": live,
+                    "base": base,
+                    "behind": base is not None and base != live,
+                    "files": [{"state": s, "path": p} for s, p in rows],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    print(api.ARTIFACT_URL.format(slug=slug))
+    print(f"  live version  {live}")
+    if base is not None:
+        note = "  (up to date)" if base == live else "  (someone published since - merge first)"
+        print(f"  base version  {base}{note}")
+    for state_name, path in rows:
+        print(f"  {state_name:<12}  {path}")
     return 0
 
 
@@ -196,7 +351,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p = sub.add_parser("publish", parents=[common], help="publish or update an artifact")
-    p.add_argument("file", help="the HTML page to publish")
+    p.add_argument(
+        "file",
+        help="the HTML page to publish, or a directory with an index.html "
+        f"(its slug and version are kept in {STATE_FILE})",
+    )
     p.add_argument("--slug", help="update this existing artifact")
     p.add_argument("--url", help="update the artifact at this claude.ai URL")
     p.add_argument("--title", help="defaults to the page's <title>")
@@ -215,8 +374,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--remove", action="append", metavar="PATH", help="delete a published file"
     )
-    p.add_argument("--mode", choices=["replace", "patch"], help="default: replace")
-    p.add_argument("--base-version", help="expected current version (default: look it up)")
+    p.add_argument(
+        "--mode",
+        choices=["replace", "patch"],
+        help="patch keeps published files you leave out; replace drops them "
+        "(default: patch for a page update, replace for a new artifact or a directory)",
+    )
+    p.add_argument(
+        "--base-version",
+        help="version this publish was made against; a newer live version is refused",
+    )
     p.add_argument("--force", action="store_true", help="overwrite a newer version")
     p.add_argument("-q", "--quiet", action="store_true")
     p.set_defaults(func=cmd_publish)
@@ -226,10 +393,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scope", choices=["mine", "shared", "all"], default="mine")
     p.set_defaults(func=cmd_list)
 
-    p = sub.add_parser("read", parents=[common], help="read a published artifact back")
+    p = sub.add_parser("read", parents=[common], help="metadata and published file manifest")
     p.add_argument("slug", help="slug or full artifact URL")
     p.add_argument("-o", "--out", help="write the metadata JSON to this file")
     p.set_defaults(func=cmd_read)
+
+    p = sub.add_parser(
+        "status", parents=[common], help="compare local files with the published version"
+    )
+    p.add_argument(
+        "path", nargs="?", default=".", help="a published directory or page (default: .)"
+    )
+    p.add_argument("--slug", help=f"artifact to compare with (default: from {STATE_FILE})")
+    p.add_argument("--url", help="artifact URL to compare with")
+    p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("whoami", parents=[common], help="check that auth works")
     p.set_defaults(func=cmd_whoami)
@@ -244,6 +421,9 @@ def main(argv: list[str] | None = None) -> int:
     except auth.AuthError as exc:
         _eprint(f"auth error: {exc}")
         return 2
+    except api.ConflictError as exc:
+        _eprint(f"error: {exc}")
+        return EXIT_CONFLICT
     except api.ApiError as exc:
         _eprint(f"error: {exc}")
         return 1

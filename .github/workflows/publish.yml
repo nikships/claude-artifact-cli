@@ -22,6 +22,7 @@ jobs:
 
       - run: python -m pip install --upgrade ruff
       - run: ruff check .
+      - run: PYTHONPATH=src python -m unittest discover -s tests -v
 
   build:
     name: Version, build and check

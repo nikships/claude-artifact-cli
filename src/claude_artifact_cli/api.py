@@ -1,11 +1,13 @@
 """Minimal client for the Claude Artifacts ("frame") API.
 
-Protocol reverse-engineered from the Claude Code CLI v2.1.273 bundle.
+Protocol reverse-engineered from the Claude Code CLI bundle (v2.1.273, checked
+against v2.1.287).
 
     POST {base}/api/frame/deploy/direct     publish
     POST {base}/api/frame/deploy/prepare    content-hash preflight (large publishes)
     POST {base}/api/frame/upload            stage blobs the preflight asked for
-    GET  {base}/api/frame/read/{slug}       read an artifact back
+    GET  {base}/api/frame/{slug}?via=model_read   metadata + file manifest
+    GET  {base}/api/frame/read/{slug}       ownership / sharing status
     GET  {base}/api/frame/frames?limit=N    list artifacts
 
 base defaults to https://api.anthropic.com. Auth is the claude.ai OAuth access
@@ -28,7 +30,7 @@ from typing import Any
 DEFAULT_BASE = "https://api.anthropic.com"
 ARTIFACT_URL = "https://claude.ai/code/artifact/{slug}"
 OAUTH_BETA = "oauth-2025-04-20"
-CLIENT_VERSION = "2.1.273"
+CLIENT_VERSION = "2.1.287"
 
 SLUG_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
@@ -61,6 +63,37 @@ class ApiError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.body = body
+
+
+class ConflictError(ApiError):
+    """A publish was refused because a newer version than baseVersion is live."""
+
+    @property
+    def live(self) -> str | None:
+        return self.body.get("live") if isinstance(self.body, dict) else None
+
+
+# Responses carry short-lived credentials: the boot's assetToken and
+# subscriptionToken, and __frame_t on every thumbnail URL. Strip them before
+# anything reaches stdout or disk.
+_FRAME_T_RE = re.compile(r"""(__frame_t=)[^&#\s'"]*""", re.IGNORECASE)
+REDACTED = "[redacted]"
+
+
+def redact(node: Any) -> Any:
+    """Copy of a response with every token-like value replaced."""
+    if isinstance(node, dict):
+        return {
+            key: REDACTED
+            if key.lower().endswith("token") and isinstance(value, str)
+            else redact(value)
+            for key, value in node.items()
+        }
+    if isinstance(node, list):
+        return [redact(item) for item in node]
+    if isinstance(node, str) and "__frame_t" in node.lower():
+        return _FRAME_T_RE.sub(lambda m: m.group(1) + REDACTED, node)
+    return node
 
 
 @dataclass
@@ -151,6 +184,8 @@ class FrameClient:
                 status,
                 parsed,
             )
+        if status == 409:
+            raise ConflictError(_describe_conflict(parsed), status, parsed)
         if status >= 400:
             raise ApiError(_describe(status, parsed), status, parsed)
         return parsed
@@ -160,10 +195,10 @@ class FrameClient:
     def list_frames(self, limit: int = 200) -> list[dict]:
         data = self._request("GET", f"/api/frame/frames?limit={int(limit)}")
         if isinstance(data, list):
-            return data
+            return redact(data)
         for key in ("frames", "results", "data"):
             if isinstance(data, dict) and isinstance(data.get(key), list):
-                return data[key]
+                return redact(data[key])
         raise ApiError("unexpected listing response shape", body=data)
 
     def read(self, slug: str) -> dict:
@@ -171,15 +206,19 @@ class FrameClient:
 
         Note: the published *bytes* are served from a separate sandboxed host
         behind a short-lived asset token, so they are not fetched here. This
-        returns paths, sizes, sha256 and content types.
+        returns paths, sizes, sha256 and content types, with tokens redacted.
         """
         quoted = urllib.parse.quote(slug)
-        boot = self._request("GET", f"/api/frame/{quoted}?via=model_read")
+        boot = redact(self._request("GET", f"/api/frame/{quoted}?via=model_read"))
         try:
-            boot["_access"] = self._request("GET", f"/api/frame/read/{quoted}")
+            boot["_access"] = redact(self._request("GET", f"/api/frame/read/{quoted}"))
         except ApiError:
             pass
         return boot
+
+    def current_version(self, slug: str) -> str | None:
+        boot = self._request("GET", f"/api/frame/{urllib.parse.quote(slug)}?via=model_read")
+        return boot.get("ver") if isinstance(boot, dict) else None
 
     def publish(
         self,
@@ -193,6 +232,31 @@ class FrameClient:
         force: bool = False,
         on_progress=lambda msg: None,
     ) -> dict:
+        # "patch" overlays the manifest onto baseVersion, so files left out are
+        # kept; "replace" makes the manifest the whole artifact. Updates default
+        # to patch, as the Artifact tool does, so publishing just the page never
+        # drops its CSS, JS or images. Explicit null removals are patch-only.
+        # This is settled on the caller's slug, before a large publish's
+        # preflight reserves one for a brand-new artifact.
+        if mode is None:
+            mode = "patch" if slug else "replace"
+        if removals and not slug:
+            raise ApiError("removing a file needs --slug/--url (there is nothing to patch)")
+        if removals and mode != "patch":
+            raise ApiError(
+                'removing a file needs --mode patch (in "replace" mode, just omit the file)'
+            )
+        if mode == "patch" and not slug:
+            raise ApiError("--mode patch needs --slug/--url (there is nothing to patch)")
+        if mode == "patch" and base_version is None:
+            # The server needs a version to overlay onto. Without one the caller
+            # knows, the live version stands in, which also means a concurrent
+            # publish made since the caller last looked is not detected.
+            on_progress("no base version known - patching onto the live version")
+            base_version = self.current_version(slug)
+            if base_version is None:
+                raise ApiError("couldn't determine the current version to patch onto")
+
         assets = [page] + list(extra or [])
         manifest: dict[str, Any] = {}
 
@@ -222,24 +286,6 @@ class FrameClient:
 
         body: dict[str, Any] = dict(meta or {})
         body["manifest"] = manifest
-        # "replace" publishes the manifest as the whole artifact, so omitting a
-        # file already drops it. Explicit null removals are only legal in "patch".
-        if mode is None:
-            mode = "patch" if (slug and (removals or base_version is not None)) else "replace"
-        if removals and mode != "patch":
-            raise ApiError(
-                'removing a file needs --mode patch (in "replace" mode, just omit the file)'
-            )
-        if removals and not slug:
-            raise ApiError("removing a file needs --slug/--url (there is nothing to patch)")
-        if mode == "patch" and base_version is None:
-            # The server overlays a patch onto a known version, so look up the
-            # current one rather than making the caller pass it.
-            on_progress("looking up current version for the patch")
-            current = self.read(slug).get("ver")
-            if current is None:
-                raise ApiError("couldn't determine the current version to patch onto")
-            base_version = current
         body["mode"] = mode
         if slug:
             body["slug"] = slug
@@ -308,6 +354,17 @@ class FrameClient:
         )
 
 
+def _describe_conflict(body: Any) -> str:
+    live = body.get("live") if isinstance(body, dict) else None
+    where = f" (live version {live})" if live else ""
+    return (
+        f"HTTP 409: a newer version{where} was published since the base version "
+        "this publish was made against. Compare with `claude-artifact status`, merge, "
+        "then publish again with --base-version set to the live version, or pass "
+        "--force to discard it."
+    )
+
+
 def _describe(status: int, body: Any) -> str:
     detail = ""
     if isinstance(body, dict):
@@ -317,7 +374,6 @@ def _describe(status: int, body: Any) -> str:
     hint = {
         403: " (the account may not have Artifacts enabled)",
         404: " (no such artifact, or it isn't yours to update)",
-        409: " (a newer version exists - re-read it, merge, and retry, or pass --force)",
         413: " (payload too large)",
         429: " (rate limited or daily publish cap reached)",
     }.get(status, "")
