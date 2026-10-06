@@ -4,31 +4,36 @@ Zero-dependency Python CLI (`claude-artifact`) for Anthropic's private Claude Ar
 
 ## Layout
 
-- `src/claude_artifact_cli/cli.py`: argparse entry point `main`; one `cmd_*` function per subcommand.
-- `src/claude_artifact_cli/api.py`: `FrameClient` HTTP transport, `Asset`, manifest wire encoding, large-publish staging.
+- `src/claude_artifact_cli/cli.py`: argparse entry point `main`; one `cmd_*` function per subcommand; directory publishing (typed included) and its `.artifact.json` state file; `read --path`; `pull` and its three-way merge `_merge_plan`; `_destination`/`_write`, which refuse unsafe paths and symlinks; `status` comparison.
+- `src/claude_artifact_cli/api.py`: `FrameClient` HTTP transport, `Asset`, manifest wire encoding, large-publish staging, `ConflictError` (409), token `redact`. `FileReader` reads published bytes from the content host and verifies them against the manifest sha256; `clean_path` validates and quotes a published path; `strip_served_page` recovers the page source from the served copy; `slug_from` accepts URLs, UUIDs and base58 short ids.
 - `src/claude_artifact_cli/auth.py`: token lookup (flag → env → macOS Keychain → `~/.claude/.credentials.json`).
 - `src/claude_artifact_cli/__init__.py`: `__version__`, the single version source (hatch reads it).
+- `tests/`: offline unit tests; the transport is mocked, nothing hits the network.
 - `skills/claude-artifact-cli/SKILL.md`: agent skill shipped with the repo. Update it when flags, behavior or errors change.
-- `.github/workflows/publish.yml`: lint, auto-version, build, PyPI publish, GitHub release.
+- `.github/workflows/publish.yml`: lint, tests, auto-version, build, PyPI publish, GitHub release.
 
 ## Commands
 
 ```bash
-uvx ruff check .                                   # the only CI lint gate
-uv build && uvx twine check --strict dist/*        # packaging check
-uv run --with . claude-artifact --help             # smoke test
-uv run --with . claude-artifact whoami             # live auth check; needs `claude /login`
+uvx ruff check .                                        # the only CI lint gate
+PYTHONPATH=src python -m unittest discover -s tests -v  # unit tests; CI runs them on Linux, macOS, Windows x Python 3.10, latest
+uv build && uvx twine check --strict dist/*             # packaging check
+uv run --with . claude-artifact --help                  # smoke test
+uv run --with . claude-artifact whoami                  # live auth check; needs `claude /login`
 ```
 
-No test suite exists. Validate changes with ruff, a build, and `--help` on affected subcommands. `whoami`, `list` and `read` hit the live API and are safe. `publish` creates or overwrites a real artifact; never run it unless the user asked.
+Validate changes with ruff, the unit tests, a build, and `--help` on affected subcommands. The tests are offline and mock the transport; add or update them with any behavior change. `whoami`, `list`, `read` (with or without `--path`), `status` and `pull` hit the live API, are read-only there, and are safe; `pull` writes only to its local directory. `publish` creates or overwrites a real artifact; never run it unless the user asked.
 
 ## Hard constraints
 
 - Standard library only. Do not add runtime dependencies.
 - `requires-python = ">=3.10"`. Do not use newer syntax.
-- Never print, log or commit a token. `whoami` shows only its length and last characters; keep it that way.
-- stdout carries only results (URL, JSON, tables). Progress and errors go to stderr. `-q` must leave exactly the URL on stdout.
-- Exit codes: `0` ok, `1` API error, `2` auth error, `130` interrupt.
+- Never print, log or commit a token. `whoami` shows only its length and last characters; keep it that way. API responses carry short-lived tokens (`assetToken`, `subscriptionToken`, `__frame_t=` in thumbnail URLs); run them through `api.redact` before they reach stdout or disk.
+- The `assetToken` never leaves `FileReader`: not in output, files, `.artifact.json`, error messages or exceptions. Raw boot responses stay inside `api.py`.
+- Content-host requests (`*.frame.claudeusercontent.com`) carry only the asset token in the query and a non-default `User-Agent`. Never send them the OAuth token or an `Authorization` header.
+- `pull` and `read --out-dir` write only clean relative paths under the target directory and never write through a symlink. Keep both checks.
+- stdout carries only results (URL, JSON, tables, file bytes, saved paths, the pulled directory). Progress and errors go to stderr. `-q` must leave exactly the URL on stdout (for `pull`, the directory).
+- Exit codes: `0` ok, `1` API error, `2` auth error, `3` version conflict (HTTP 409), `130` interrupt.
 - Only `Authorization` and `anthropic-beta: oauth-2025-04-20` headers are load-bearing. Keep the `X-Frame-*` headers and `CLIENT_VERSION` mirroring the Claude Code CLI.
 - `TEXT_TYPES` in `api.py` must match the Claude Code client's set exactly; other content types are base64 on the wire.
 - Delete, pin and capabilities are not reachable on the direct API path. Do not guess endpoints for them.
@@ -36,7 +41,7 @@ No test suite exists. Validate changes with ruff, a build, and `--help` on affec
 
 ## Releases
 
-Every push to `main` that touches `src/` or `pyproject.toml` releases automatically:
+Every push to `main` that touches `src/` or `pyproject.toml` releases automatically, once Ruff and the test matrix pass:
 
 1. If `__version__` is not on PyPI yet, CI publishes it as-is. Otherwise CI bumps the patch, commits `chore(release): vX.Y.Z [skip ci]` to `main`, and publishes that.
 2. Publishing uses PyPI trusted publishing (environment `pypi`, workflow `publish.yml`). No tokens.
