@@ -263,6 +263,7 @@ class FileReader:
             with self._opener.open(req, timeout=self._client.timeout) as resp:
                 return resp.status, resp.read()
         except urllib.error.HTTPError as exc:
+            exc.close()
             return exc.code, b""
         except urllib.error.URLError as exc:
             raise ApiError(

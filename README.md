@@ -95,7 +95,7 @@ claude-artifact publish index.html --slug <slug> \
 | `--file PUB[=SRC]` | Supporting file. Without `=`, published and source paths match. Repeatable. Not allowed with a directory. |
 | `--root` | Base directory for `--file` sources. Published paths are unchanged. Not allowed with a directory. |
 | `--remove PATH` | Delete a published file. Needs an existing artifact and patch mode; with no `--mode`, `--remove` uses patch. |
-| `--mode patch\|replace` | `patch` overlays the manifest onto the base version, so published files you don't pass are kept. Default when updating a page. `replace` makes the manifest the whole artifact, so any published file you leave out is removed. Default for a new artifact and for a directory. |
+| `--mode patch\|replace` | `patch` overlays the manifest onto the base version, so published files you don't pass are kept. Default when updating a page. `replace` makes the manifest the whole artifact, so any published file you leave out is removed. Default for a new artifact and for the first publish of a directory. A directory with `.artifact.json` patches (see below). |
 | `--base-version` | The version this publish was made against. If a newer version is live, the publish is refused with exit code `3`. Defaults to the version in a directory's `.artifact.json` (when publishing to the slug saved there). Without one, patch uses the live version and replace is not checked, so a concurrent publish goes undetected. |
 | `--force` | Publish even if a newer version is live, discarding it. |
 | `-q`, `--quiet` | Print only the URL. |
@@ -109,7 +109,7 @@ claude-artifact publish ./site --favicon 📊   # new artifact; writes ./site/.a
 claude-artifact publish ./site                # later: updates the same artifact
 ```
 
-Publishes every file under the directory, recursively, skipping dotfiles and dot-directories. `index.html` is required at the top level (except for a typed artifact, below); symlinks are refused. A directory defaults to `--mode replace`: it is the whole artifact, so a file deleted locally is deleted on the next publish.
+Publishes every file under the directory, recursively, skipping dotfiles and dot-directories. `index.html` is required at the top level (except for a typed artifact, below); symlinks are refused. The first publish of a directory replaces: the directory is the whole artifact. Once `.artifact.json` lists its files, `publish DIR` patches: it sends the directory's files and removes the ones deleted locally since the last pull or publish, leaving files the directory never held (dot paths, a type's files) alone. `--mode replace` forces a full replace.
 
 After each successful publish (and each `pull`) the CLI writes `DIR/.artifact.json`:
 
@@ -135,7 +135,7 @@ claude-artifact pull <slug-or-url> ./site
 claude-artifact publish ./site                  # after editing: same artifact, pulled version as base
 ```
 
-Downloads the live version's files into `DIR` (default: a directory named after the slug), writes `DIR/.artifact.json`, and prints `DIR` on stdout. stderr reports the version, files written and removed, local edits kept, and files left out because the artifact's type supplies them. `-q` silences it.
+Downloads the live version's files into `DIR` (default: a directory named after the slug), writes `DIR/.artifact.json`, and prints `DIR` on stdout. stderr reports the version, files written and removed, local edits kept, and files left out: those the artifact's type supplies, and dot paths such as `.well-known/…`, which directories never hold (`read --path` still fetches them). `-q` silences it.
 
 Pulling into a directory already linked to the same artifact merges file by file against the hashes in `.artifact.json`:
 
@@ -170,7 +170,7 @@ https://claude.ai/code/artifact/<slug>
   remote-only   old.js
 ```
 
-Compares the sha256 of each local file with the published manifest; for older artifacts whose manifest has no sha256, it fetches the file to compare. Files an Artifact type supplies are ignored. The base version line appears only for a directory with `.artifact.json`, and reads `(up to date)` when it matches the live version. When anything differs, stderr suggests `merge the live version in: claude-artifact pull <slug> DIR` for a linked directory, else `live copy: claude-artifact pull <slug> <another-dir>`. `--json` prints `{"slug", "url", "live", "base", "behind", "files": [{"state", "path"}]}`. `PATH` defaults to `.`; `--slug`/`--url` override `.artifact.json`.
+Compares the sha256 of each local file with the published manifest; for older artifacts whose manifest has no sha256, it fetches the file to compare. Files an Artifact type supplies, and dot paths, are ignored: directories never hold them. The base version line appears only for a directory with `.artifact.json`, and reads `(up to date)` when it matches the live version. When anything differs, stderr suggests `merge the live version in: claude-artifact pull <slug> DIR` for a linked directory, else `live copy: claude-artifact pull <slug> <another-dir>`. `--json` prints `{"slug", "url", "live", "base", "behind", "files": [{"state", "path"}]}`. `PATH` defaults to `.`; `--slug`/`--url` override `.artifact.json`.
 
 On exit code `3` from `publish`:
 

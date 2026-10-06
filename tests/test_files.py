@@ -782,7 +782,7 @@ class PullTest(FilesCase):
     def test_symlink_on_write_path_refused(self):
         outside = self.tmp / "outside"
         outside.mkdir()
-        for name in ("assets", ".well-known"):  # the dot-dir isn't walked, so _write must catch it
+        for name in ("assets",):
             with self.subTest(name=name):
                 site = self.tmp / f"site-{name}"
                 site.mkdir()
@@ -792,6 +792,36 @@ class PullTest(FilesCase):
                     self.run_cli("pull", "s1", site)
                 self.assertIn("symlink", str(ctx.exception))
                 self.assertEqual(os.listdir(outside), [])
+
+    def test_dot_paths_are_left_out(self):
+        site = self.tmp / "site"
+        self.live(
+            files={
+                "index.html": b"<p>",
+                ".well-known/a.txt": b"x",
+                ".artifact.json": b'{"slug": "evil"}',
+            }
+        )
+        code, _, err = self.run_cli("pull", "s1", site)
+        self.assertEqual(code, 0)
+        self.assertIn("left out 2 dot-path file(s)", err)
+        self.assertFalse((site / ".well-known").exists())
+        state = json.loads((site / ".artifact.json").read_text())
+        self.assertEqual(state["slug"], "s1")
+        self.assertEqual(set(state["files"]), {"index.html"})
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "needs symlinks")
+    def test_read_out_dir_refuses_symlinked_dot_dir(self):
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        out = self.tmp / "out"
+        out.mkdir()
+        os.symlink(outside, out / ".well-known")
+        self.live(files={".well-known/a.txt": b"x"})
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_cli("read", "s1", "--path", ".well-known/a.txt", "--out-dir", out)
+        self.assertIn("symlink", str(ctx.exception))
+        self.assertEqual(os.listdir(outside), [])
 
     def test_unsafe_manifest_path_not_written(self):
         self.live(files={"../evil.txt": b"x"})

@@ -202,9 +202,32 @@ class PublishDirTest(CliCase):
         self.assertEqual(code, 0)
         self.assertEqual(server.paths(), [DEPLOY])
         body = server.deployed()
-        self.assertEqual((body["slug"], body["baseVersion"], body["mode"]), ("d1", "v1", "replace"))
+        # Once .artifact.json lists the directory's files, a republish patches.
+        self.assertEqual((body["slug"], body["baseVersion"], body["mode"]), ("d1", "v1", "patch"))
         self.assertNotIn(".artifact.json", body["manifest"])
         self.assertEqual(json.loads((site / ".artifact.json").read_text())["version"], "v2")
+
+    def test_republish_removes_only_files_deleted_locally(self):
+        site = self.make_site()
+        self.serve({DEPLOY: {"slug": "d1", "version": "v1"}})
+        self.run_cli("publish", site, "-q")
+        (site / "img" / "logo.png").unlink()
+        server = self.serve({DEPLOY: {"slug": "d1", "version": "v2"}})
+        self.run_cli("publish", site, "-q")
+        manifest = server.deployed()["manifest"]
+        self.assertIsNone(manifest["img/logo.png"])
+        self.assertEqual(
+            {k for k, v in manifest.items() if v is not None}, {"index.html", "css/app.css"}
+        )
+        self.assertNotIn("img/logo.png", json.loads((site / ".artifact.json").read_text())["files"])
+
+    def test_explicit_replace_still_replaces(self):
+        site = self.make_site()
+        self.serve({DEPLOY: {"slug": "d1", "version": "v1"}})
+        self.run_cli("publish", site, "-q")
+        server = self.serve({DEPLOY: {"slug": "d1", "version": "v2"}})
+        self.run_cli("publish", site, "--mode", "replace", "-q")
+        self.assertEqual(server.deployed()["mode"], "replace")
 
     def test_explicit_slug_or_base_version_overrides_state(self):
         site = self.make_site()

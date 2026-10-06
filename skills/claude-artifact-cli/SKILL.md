@@ -126,10 +126,12 @@ the HTML references. For more than a few files, publish the directory instead;
 ### Removing files, and the two modes
 
 - `patch` overlays the manifest onto a base version: files you leave out are
-  kept. Default for updating a page (`--slug`/`--url`) and for a typed directory.
-  The only mode that takes explicit deletions.
+  kept. Default for updating a page (`--slug`/`--url`) and for republishing a
+  directory that has `.artifact.json`. The only mode that takes explicit
+  deletions.
 - `replace` makes the manifest the whole artifact: **every published file you
-  leave out is removed**. Default for a new artifact and for a directory publish.
+  leave out is removed**. Default for a new artifact and for the first publish
+  of a directory.
   Pass `--mode replace` on a page update only when the files you pass really are
   the whole artifact.
 
@@ -180,16 +182,20 @@ claude-artifact publish ./site                # same artifact, no --slug needed
 - `publish DIR` publishes every non-dot file under the directory, recursively.
   `index.html` is required at the top (except for a typed artifact). Symlinks
   are refused; copy the file in.
-- Replace mode by default (patch for a typed artifact): the directory **is** the
-  artifact, so files deleted locally are deleted on publish.
+- The first publish of a directory replaces: the directory **is** the
+  artifact. Once `.artifact.json` lists its files, `publish DIR` patches: it
+  sends the directory's files and removes the ones deleted locally since the last
+  pull or publish. Files the directory never held (dot paths, a type's files)
+  are left alone. `--mode replace` forces a full replace.
 - `pull` and each successful `publish` write `.artifact.json`: `slug`, `url`,
   `version`, `title`, `files` (published path → sha256), and `"typed": true` for
   a typed artifact. It is a dotfile, so it is never published. The next
   `publish DIR` updates that slug and sends that version as the base version, so
   a newer publish by someone else fails with exit 3 instead of being overwritten.
 - `pull` prints the directory on stdout; stderr says the version, files written
-  and removed, local edits kept, and type files left out. Default directory: one
-  named after the slug.
+  and removed, local edits kept, and files left out: the type's, and dot paths
+  such as `.well-known/…`, which directories never hold (`read --path` still
+  fetches them). Default directory: one named after the slug.
 
 ### Pulling into a directory you already have
 
@@ -222,7 +228,7 @@ An artifact made from an Artifact type (Slides, Design, …) holds files the typ
 supplies — `index.html`, `SKILL.md`, `artifact-type/…` — which are fixed.
 
 - `pull` leaves them out and marks `.artifact.json` `"typed": true`; `status`
-  ignores them.
+  ignores them (and dot paths).
 - Edit only the artifact's own files, the ones `pull` wrote. Never add
   `index.html`, `SKILL.md` or `artifact-type/` to the directory.
 - `publish DIR` patches only those files. A local `index.html` is refused, as is

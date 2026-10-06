@@ -28,6 +28,7 @@ jobs:
   test:
     name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     permissions:
       contents: read
     strategy:

@@ -97,6 +97,16 @@ def _target_slug(args) -> str | None:
     return api.slug_from(value) if value else None
 
 
+def _is_dot_path(path: str) -> bool:
+    """Directories never hold these: publish skips them, so pull and status do too.
+
+    An unclean path (such as one with "..") is not a dot path; it is refused.
+    """
+    return api.clean_path(path) is not None and any(
+        part.startswith(".") for part in path.split("/")
+    )
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -170,6 +180,9 @@ def cmd_publish(args) -> int:
         if base_version is None and same_artifact:
             base_version = state.get("version")
         typed = same_artifact and state.get("typed") is True
+        known = state.get("files") if same_artifact else None
+        if not isinstance(known, dict):
+            known = None
         if typed and mode == "replace":
             raise SystemExit(
                 "error: an artifact made from a type can only be patched; its type's "
@@ -182,17 +195,18 @@ def cmd_publish(args) -> int:
             )
         if not typed and "index.html" not in files:
             raise SystemExit(f"error: no index.html in {target}")
-        if typed:
-            # An Artifact type's own files stay fixed and aren't in the
-            # directory, so patch only this artifact's files, and turn files
-            # deleted locally since the last pull or publish into removals.
-            if mode is None:
-                mode = "patch"
-            known = state.get("files") if isinstance(state.get("files"), dict) else {}
-            removals = sorted((set(known) - set(files)) | set(args.remove or []))
-        elif mode is None and not args.remove:
-            # The directory is the whole artifact, so files deleted locally go too.
-            mode = "replace"
+        if mode == "patch" or (mode is None and (typed or known is not None)):
+            # The directory manages the files .artifact.json lists: patch those,
+            # and remove the ones deleted locally since the last pull or
+            # publish. Files it never had (dotfiles, an Artifact type's fixed
+            # files) are left alone.
+            mode = "patch"
+            removals = sorted((set(known or {}) - set(files)) | set(args.remove or []))
+        else:
+            # A first publish of the directory: it is the whole artifact.
+            if mode is None and not args.remove:
+                mode = "replace"
+            removals = list(args.remove or [])
         index = files.pop("index.html", None)
         raw = index.read_bytes() if index else b""
         page = api.Asset(path="index.html", data=raw, content_type="text/html") if index else None
@@ -202,8 +216,6 @@ def cmd_publish(args) -> int:
         ]
         fallback_title = target.resolve().name
         state_root = target
-        if not typed:
-            removals = list(args.remove or [])
     elif target.is_file():
         raw = target.read_bytes()
         content_type = api.guess_content_type(target.name)
@@ -386,7 +398,9 @@ def cmd_pull(args) -> int:
     if root.exists() and not root.is_dir():
         raise SystemExit(f"error: {root} exists and is not a directory")
     reader = _client(args).files(slug)
-    own = sorted(p for p in reader.files if not reader.type_owned(p))
+    typed = any(reader.type_owned(p) for p in reader.files)
+    dotted = sorted(p for p in reader.files if not reader.type_owned(p) and _is_dot_path(p))
+    own = sorted(p for p in reader.files if not reader.type_owned(p) and not _is_dot_path(p))
 
     state = _load_state(root) if root.is_dir() else {}
     refreshing = state.get("slug") == slug
@@ -427,8 +441,8 @@ def cmd_pull(args) -> int:
         "title": reader.meta.get("title"),
         "files": remote_sha,
     }
-    skipped = len(reader.files) - len(own)
-    if skipped:
+    skipped = len(reader.files) - len(own) - len(dotted)
+    if typed:
         state["typed"] = True
     _save_state(root, state)
 
@@ -441,6 +455,8 @@ def cmd_pull(args) -> int:
             _eprint(f"  kept {len(plan.kept)} local edit(s): {', '.join(plan.kept)}")
         if skipped:
             _eprint(f"  left out {skipped} file(s) supplied by the artifact's type")
+        if dotted:
+            _eprint(f"  left out {len(dotted)} dot-path file(s), which directories don't hold")
     return 0
 
 
@@ -489,11 +505,14 @@ def cmd_status(args) -> int:
     data = client.read(slug)
     live = data.get("ver")
     base = state.get("version") if state.get("slug") == slug else None
-    # Files an Artifact type supplies aren't the artifact's own and never pulled.
+    # Files an Artifact type supplies, and dot paths, are never in a directory.
     remote = {
         f["path"]: f.get("sha256")
         for f in data.get("files") or []
-        if isinstance(f.get("path"), str) and not isinstance(f.get("src"), dict)
+        if isinstance(f, dict)
+        and isinstance(f.get("path"), str)
+        and not isinstance(f.get("src"), dict)
+        and not _is_dot_path(f["path"])
     }
     reader = None
 
