@@ -524,6 +524,32 @@ class ContentHostTransportTest(FilesCase):
 READ_FILES = {"index.html": b"<p>hi</p>", "img/logo.png": b"\x89PNG\x00\xff", "a b.txt": b"x"}
 
 
+class DestinationTest(unittest.TestCase):
+    def test_windows_unsafe_names(self):
+        for part in ("C:", "C:evil", "a:stream", "CON", "nul.txt", "com1", "a.", "a ", "a?b", "x|y"):
+            with self.subTest(part=part):
+                self.assertTrue(cli._unsafe_on_windows(part))
+        for part in ("index.html", "a b.txt", "console.js", "LPT", "comx.txt", ".x"):
+            with self.subTest(part=part):
+                self.assertFalse(cli._unsafe_on_windows(part))
+
+    def test_windows_unsafe_path_refused_on_windows(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(cli, "_ON_WINDOWS", True):
+            with self.assertRaises(SystemExit):
+                cli._destination(Path(tmp), "C:evil/x.txt")
+            self.assertEqual(cli._destination(Path(tmp), "a/b.txt"), Path(tmp) / "a" / "b.txt")
+
+    def test_destination_must_resolve_inside_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            root.mkdir()
+            with (
+                mock.patch.object(cli.api, "clean_path", return_value="x"),
+                self.assertRaises(SystemExit),
+            ):
+                cli._destination(root, "../outside.txt")
+
+
 class ReadPathTest(FilesCase):
     def test_one_path_writes_raw_bytes_to_stdout(self):
         self.live(files=READ_FILES)

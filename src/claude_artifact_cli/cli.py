@@ -101,15 +101,38 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+_ON_WINDOWS = os.name == "nt"
+_WINDOWS_RESERVED = re.compile(r"^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(\..*)?$", re.IGNORECASE)
+
+
+def _unsafe_on_windows(part: str) -> bool:
+    """Names Windows would resolve somewhere else: drives, streams, devices, aliases."""
+    return (
+        ":" in part
+        or bool(re.search(r'[<>"|?*]', part))
+        or bool(_WINDOWS_RESERVED.match(part))
+        or part.endswith((".", " "))
+    )
+
+
 def _destination(root: Path, published: str) -> Path:
-    """Where a published path lands under root, refusing anything that escapes it."""
-    if api.clean_path(published) is None:
+    """Where a published path lands under root, refusing anything that escapes it.
+
+    Manifest paths come from the server and, for a shared artifact, from other
+    people, so they're checked before anything is written.
+    """
+    parts = published.split("/")
+    if api.clean_path(published) is None or (
+        _ON_WINDOWS and any(_unsafe_on_windows(p) for p in parts)
+    ):
         raise SystemExit(f"error: refusing to write unsafe path {published!r}")
     dest = root
-    for part in published.split("/"):
+    for part in parts:
         dest = dest / part
         if dest.is_symlink():
             raise SystemExit(f"error: {dest} is a symlink; refusing to write through it")
+    if not dest.resolve().is_relative_to(root.resolve()):
+        raise SystemExit(f"error: refusing to write {published!r} outside {root}")
     return dest
 
 
