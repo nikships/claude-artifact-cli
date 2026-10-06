@@ -225,7 +225,7 @@ class AutoUpdateTest(UpdateCase):
 class WindowsUpdateTest(UpdateCase):
     def test_update_runs_detached_on_windows(self):
         call = self.patch(update.subprocess, "call")
-        with mock.patch.object(update.os, "name", "nt"), mock.patch.multiple(
+        with mock.patch.object(update, "_ON_WINDOWS", True), mock.patch.multiple(
             update.subprocess, DETACHED_PROCESS=8, CREATE_NEW_PROCESS_GROUP=512, create=True
         ):
             err = io.StringIO()
@@ -250,6 +250,7 @@ class StateRaceTest(UpdateCase):
 
 class CliTest(UpdateCase):
     def test_update_command_runs_the_upgrade(self):
+        self.patch(update, "_ON_WINDOWS", new=False)
         call = self.patch(update.subprocess, "call", return_value=0)
         err = io.StringIO()
         with contextlib.redirect_stderr(err):

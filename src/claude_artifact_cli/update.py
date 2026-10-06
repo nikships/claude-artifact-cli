@@ -30,6 +30,7 @@ CHECK_INTERVAL = 24 * 60 * 60
 FAIL_BACKOFF = 60 * 60
 FETCH_TIMEOUT = 2
 JOIN_TIMEOUT = 1.5
+_ON_WINDOWS = os.name == "nt"
 
 
 def _config_dir() -> str:
@@ -213,7 +214,7 @@ def _spawn(argv: list[str]) -> bool:
             log.flush()
             detach = (
                 {"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
-                if os.name == "nt"
+                if _ON_WINDOWS
                 else {"start_new_session": True}
             )
             subprocess.Popen(
@@ -230,7 +231,7 @@ def cmd_update(args) -> int:
     if argv[0] != sys.executable and shutil.which(argv[0]) is None:
         print(f"{argv[0]} is not on PATH. To upgrade, run: {upgrade_command()}", file=sys.stderr)
         return 1
-    if os.name == "nt":
+    if _ON_WINDOWS:
         # Windows locks the running claude-artifact.exe, so the upgrade has to
         # replace it after this process exits.
         if not _spawn(argv):
