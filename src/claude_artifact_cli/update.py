@@ -150,7 +150,8 @@ def start_check() -> dict | None:
         try:
             found = _fetch_latest()
             holder["latest"] = found
-            _save_state({**state, "checked_at": time.time(), "latest": found})
+            # Reload: the main thread may have recorded an upgrade meanwhile.
+            _save_state({**_load_state(), "checked_at": time.time(), "latest": found})
         except (OSError, ValueError, KeyError, TypeError, http.client.HTTPException):
             pass  # offline or a PyPI blip: the attempt saved above retries in an hour
 
@@ -197,8 +198,14 @@ def _start_upgrade(latest: str) -> bool:
     ):
         return False
     argv = upgrade_argv()
-    if shutil.which(argv[0]) is None:
+    if shutil.which(argv[0]) is None or not _spawn(argv):
         return False
+    _save_state({**_load_state(), "upgrade_to": latest, "upgrade_started_at": time.time()})
+    return True
+
+
+def _spawn(argv: list[str]) -> bool:
+    """Run argv detached, after this process, logging to LOG_FILE."""
     try:
         os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
         with open(LOG_FILE, "a", encoding="utf-8") as log:
@@ -214,15 +221,22 @@ def _start_upgrade(latest: str) -> bool:
             )
     except OSError:
         return False
-    _save_state({**state, "upgrade_to": latest, "upgrade_started_at": time.time()})
     return True
 
 
 def cmd_update(args) -> int:
-    """Upgrade now, in the foreground."""
+    """Upgrade now: in the foreground, or detached on Windows."""
     argv = upgrade_argv()
     if argv[0] != sys.executable and shutil.which(argv[0]) is None:
         print(f"{argv[0]} is not on PATH. To upgrade, run: {upgrade_command()}", file=sys.stderr)
         return 1
+    if os.name == "nt":
+        # Windows locks the running claude-artifact.exe, so the upgrade has to
+        # replace it after this process exits.
+        if not _spawn(argv):
+            print(f"couldn't start the upgrade. Run: {upgrade_command()}", file=sys.stderr)
+            return 1
+        print(f"upgrading in the background: {upgrade_command()} (log: {LOG_FILE})", file=sys.stderr)
+        return 0
     print(f"running: {upgrade_command()}", file=sys.stderr)
     return subprocess.call(argv)

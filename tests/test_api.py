@@ -1,11 +1,15 @@
 import base64
 import io
 import json
+import os
 import unittest
 import urllib.error
 from unittest import mock
 
 from claude_artifact_cli import api
+
+# Never reach PyPI or upgrade the install running the tests.
+os.environ.setdefault("CLAUDE_ARTIFACT_NO_UPDATE_CHECK", "1")
 
 DEPLOY = ("POST", "/api/frame/deploy/direct")
 

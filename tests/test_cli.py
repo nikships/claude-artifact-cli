@@ -11,6 +11,9 @@ from unittest import mock
 
 from claude_artifact_cli import api, auth, cli
 
+# Never reach PyPI or upgrade the install running the tests.
+os.environ.setdefault("CLAUDE_ARTIFACT_NO_UPDATE_CHECK", "1")
+
 DEPLOY = ("POST", "/api/frame/deploy/direct")
 URL = "https://claude.ai/code/artifact/{}"
 

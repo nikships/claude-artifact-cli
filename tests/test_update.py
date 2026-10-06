@@ -10,9 +10,12 @@ from unittest import mock
 
 from claude_artifact_cli import cli, update
 
-UV_PREFIX = os.path.join(os.sep, "home", "u", ".local", "share", "uv", "tools", "x")
-PIPX_PREFIX = os.path.join(os.sep, "home", "u", ".local", "pipx", "venvs", "x")
-PIP_PREFIX = os.path.join(os.sep, "home", "u", "venv")
+# Under the temp dir: realpath() on a made-up /home path is slow where /home is
+# an automount (macOS).
+_ROOT = os.path.realpath(tempfile.gettempdir())
+UV_PREFIX = os.path.join(_ROOT, "u", ".local", "share", "uv", "tools", "x")
+PIPX_PREFIX = os.path.join(_ROOT, "u", ".local", "pipx", "venvs", "x")
+PIP_PREFIX = os.path.join(_ROOT, "u", "venv")
 ENV_KEYS = ("CI", "CLAUDE_ARTIFACT_NO_UPDATE_CHECK", "CLAUDE_ARTIFACT_NO_AUTO_UPDATE")
 
 
@@ -217,6 +220,32 @@ class AutoUpdateTest(UpdateCase):
         self.fetch.return_value = "1.0.0"
         self.assertEqual(self.run_check(), "")
         self.popen.assert_not_called()
+
+
+class WindowsUpdateTest(UpdateCase):
+    def test_update_runs_detached_on_windows(self):
+        call = self.patch(update.subprocess, "call")
+        with mock.patch.object(update.os, "name", "nt"), mock.patch.multiple(
+            update.subprocess, DETACHED_PROCESS=8, CREATE_NEW_PROCESS_GROUP=512, create=True
+        ):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(update.cmd_update(None), 0)
+        call.assert_not_called()
+        self.assertEqual(self.popen.call_args.kwargs["creationflags"], 8 | 512)
+        self.assertIn("upgrading in the background", err.getvalue())
+
+
+class StateRaceTest(UpdateCase):
+    def test_late_fetch_keeps_the_recorded_upgrade(self):
+        self.fetch.return_value = "1.1.0"
+        holder = update.start_check()
+        holder["thread"].join()
+        update._save_state({**update._load_state(), "upgrade_to": "1.1.0", "upgrade_started_at": 5})
+        # A second fetch finishing late must merge into what's on disk.
+        self.state_file.write_text(json.dumps({**self.state(), "checked_at": 0}))
+        update.start_check()["thread"].join()
+        self.assertEqual(self.state()["upgrade_to"], "1.1.0")
 
 
 class CliTest(UpdateCase):
