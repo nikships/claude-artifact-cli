@@ -124,6 +124,19 @@ class PublishModeTest(ApiCase):
             self.client().publish(page(), slug="s1")
         self.assertNotIn(DEPLOY, server.paths())
 
+    def test_typed_publish_without_page(self):
+        server = self.serve({DEPLOY: {"slug": "t1", "version": "v2"}})
+        data = api.Asset("data.json", b"{}", "application/json")
+        self.client().publish(
+            None, extra=[data], removals=["old.csv"], slug="t1", base_version="v1"
+        )
+        body = server.body()
+        self.assertEqual(body["mode"], "patch")
+        self.assertEqual(
+            body["manifest"],
+            {"data.json": {"content": "{}", "contentType": "application/json"}, "old.csv": None},
+        )
+
 
 class ConflictTest(unittest.TestCase):
     def http_error(self, status, body):
@@ -143,6 +156,16 @@ class ConflictTest(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 409)
         self.assertEqual(ctx.exception.live, "v9")
         self.assertIn("v9", str(ctx.exception))
+
+    def test_409_message_points_at_pull(self):
+        err = self.http_error(409, {"live": "v9"})
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=err),
+            self.assertRaises(api.ConflictError) as ctx,
+        ):
+            api.FrameClient("test-token").publish(page(), slug="s1", base_version="v1")
+        self.assertIn("claude-artifact pull SLUG DIR", str(ctx.exception))
+        self.assertIn("--force", str(ctx.exception))
 
     def test_other_errors_are_plain_api_errors(self):
         err = self.http_error(500, {"message": "boom"})
@@ -261,6 +284,29 @@ class WireTest(ApiCase):
             self.client().publish(page(), extra=[api.Asset("big.png", b"\x00" * 64, "image/png")])
         self.assertEqual(server.body()["mode"], "replace")
         self.assertNotIn(boot_path("fresh"), server.paths())
+
+
+    def test_large_typed_publish_stages_only_extra(self):
+        big = api.Asset("big.png", b"\x00" * 64, "image/png")
+        server = self.serve(
+            {
+                ("POST", "/api/frame/deploy/prepare"): {"slug": "t1", "missing": [big.sha256]},
+                ("POST", "/api/frame/upload"): {},
+                DEPLOY: {"slug": "t1"},
+            }
+        )
+        with mock.patch.object(api, "INLINE_BUDGET", 10):
+            self.client().publish(None, extra=[big], slug="t1", base_version="v1")
+        self.assertEqual(server.body("POST", "/api/frame/deploy/prepare")["shas"], [big.sha256])
+        manifest = server.body()["manifest"]
+        self.assertEqual(manifest, {"big.png": {"sha256": big.sha256, "contentType": "image/png"}})
+
+    def test_large_page_alone_is_sent_inline(self):
+        server = self.serve({DEPLOY: {"slug": "s1"}})
+        with mock.patch.object(api, "INLINE_BUDGET", 10):
+            self.client().publish(page("x" * 64), slug="s1", base_version="v1")
+        self.assertEqual(server.paths(), [DEPLOY])
+        self.assertEqual(server.body()["manifest"]["index.html"]["content"], "x" * 64)
 
 
 if __name__ == "__main__":

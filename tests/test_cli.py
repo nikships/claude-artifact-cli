@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -132,6 +133,17 @@ class ExitCodeTest(CliCase):
         self.assertEqual(code, 3)
         self.assertIn("v9", err)
 
+    def test_real_409_exits_3_and_suggests_pull(self):
+        raw = io.BytesIO(json.dumps({"live": "v9"}).encode())
+        err_409 = urllib.error.HTTPError("https://x", 409, "conflict", {}, raw)
+        self.addCleanup(err_409.close)
+        page = self.write("page.html", "<p>x</p>")
+        with mock.patch("urllib.request.urlopen", side_effect=err_409):
+            code, _, err = self.run_cli("publish", page, "--slug", "s1", "--base-version", "v1")
+        self.assertEqual(code, 3)
+        self.assertIn("live version v9", err)
+        self.assertIn("claude-artifact pull", err)
+
     def test_api_error_exits_1(self):
         self.serve({("GET", "/api/frame/frames?limit=200"): api.ApiError("HTTP 500", 500)})
         self.assertEqual(self.run_cli("list")[0], 1)
@@ -167,7 +179,18 @@ class PublishDirTest(CliCase):
         self.assertEqual(manifest["css/app.css"]["content"], "p{}")
         state = json.loads((site / ".artifact.json").read_text())
         self.assertEqual(
-            state, {"slug": "d1", "url": URL.format("d1"), "version": "v1", "title": "Site"}
+            state,
+            {
+                "slug": "d1",
+                "url": URL.format("d1"),
+                "version": "v1",
+                "title": "Site",
+                "files": {
+                    "index.html": sha(b"<title>Site</title>"),
+                    "css/app.css": sha(b"p{}"),
+                    "img/logo.png": sha(b"\x89PNG\x00"),
+                },
+            },
         )
 
     def test_republish_reuses_slug_and_base_version(self):
