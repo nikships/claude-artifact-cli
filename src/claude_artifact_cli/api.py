@@ -708,26 +708,28 @@ class FrameClient:
         if slug and reserved != slug:
             raise ApiError("preflight answered for a different artifact - not publishing")
 
-        missing = [s for s in prep.get("missing") or [] if s in by_sha]
-        if not missing:
-            return reserved, []
+        answered = prep.get("missing", [])
+        if not isinstance(answered, list):
+            raise ApiError("malformed preflight answer", body=prep)
+        missing = [s for s in answered if s in by_sha]
 
         batch: list[Asset] = []
         size = 0
-        staged: list[Asset] = []
         for sha in missing:
             asset = by_sha[sha]
             cost = asset.wire_bytes()
             if batch and size + cost > UPLOAD_BATCH:
                 self._upload(reserved, batch, on_progress)
-                staged.extend(batch)
                 batch, size = [], 0
             batch.append(asset)
             size += cost
         if batch:
             self._upload(reserved, batch, on_progress)
-            staged.extend(batch)
-        return reserved, staged
+        # Every hash the preflight didn't ask for is already stored, typically
+        # the unchanged files of a republish. Reference those by hash too:
+        # sending them inline puts a large republish over the deploy body cap
+        # (HTTP 413) even though nothing new needs to travel.
+        return reserved, list(assets)
 
     def _copy(self, copies: list[Copy], slug: str | None, on_progress) -> str:
         """Have the server copy files from other artifacts into this one."""

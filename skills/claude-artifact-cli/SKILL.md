@@ -101,6 +101,37 @@ The set you pass replaces the stored declaration; a publish without
 `--contract VERSION|latest` pins or upgrades the runtime; leave it off unless
 the user asked, since it changes how the page behaves.
 
+### Offering a file download
+
+claude.ai blocks a plain `<a href="deck.pptx" download>` inside an artifact:
+the viewer gets "File downloads are not available for this artifact".
+`publish` warns when the page has an `<a download>` link and neither the
+publish nor the artifact's stored declaration includes `downloads`. To offer a
+file (a published one, or one the page generates):
+
+1. Publish with `--capability downloads` (a later publish without
+   `--capability` keeps it).
+2. In the click handler, save through the capability:
+
+```js
+const downloads = await claude.use("downloads");          // null: unavailable
+link.addEventListener("click", async (event) => {
+  if (!downloads) return;                                 // keep the plain link as fallback
+  event.preventDefault();
+  const data = await (await fetch("deck.pptx")).blob();   // published with the page
+  try {
+    await downloads.save({ filename: "deck.pptx", data });
+  } catch (err) {
+    // the viewer cancelled, or the save failed: say so on the page
+  }
+});
+```
+
+The viewer confirms each save in a dialog ("Let this artifact download a
+file?", with the name and size). Call `save` only from an explicit click.
+Verify it yourself by opening the artifact on claude.ai and clicking the link:
+a publish that succeeds says nothing about whether downloads work.
+
 ### Copy files from another artifact
 
 ```bash
@@ -207,7 +238,10 @@ claude-artifact publish ./site                # same artifact, no --slug needed
 
 - `publish DIR` publishes every non-dot file under the directory, recursively.
   `index.html` is required at the top (except for a typed artifact). Symlinks
-  are refused; copy the file in.
+  are refused; copy the file in. Files are capped at 20 MiB each. Over ~15 MB
+  in total, the CLI uploads only the files the server doesn't already have and
+  references the rest by hash, so republishing a large site after a small
+  edit is quick.
 - The first publish of a directory replaces: the directory **is** the
   artifact. Once `.artifact.json` lists its files, `publish DIR` patches: it
   sends the directory's files and removes the ones deleted locally since the last
@@ -475,5 +509,7 @@ interrupted.
 | `… names a document, not a collection` | collections have an odd number of segments |
 | `contract … has no capability …` | misspelled `--capability`; the error lists valid names |
 | `deleting … pass --yes` | `delete` needs `--yes`, and the user's go-ahead |
+| `HTTP 413: Request exceeds the maximum size` on publish | 0.3.0 and earlier sent already-stored files inline, so republishing a directory over ~15 MB failed: `claude-artifact update` |
+| `warning: the page has <a download> links …`, or "File downloads are not available for this artifact" on claude.ai | see "Offering a file download" |
 
 Full protocol notes: https://github.com/nikships/claude-artifact-cli#the-protocol

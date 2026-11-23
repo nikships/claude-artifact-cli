@@ -490,6 +490,54 @@ class PublishExtrasTest(Case):
         self.assertEqual(body["contract"], "0.2.70")
         self.assertEqual(body["capabilities"], {"db": {}, "user": {}, "downloads": True})
 
+    def test_download_link_without_downloads_capability_warns(self):
+        page = self.write("dl.html", '<title>P</title><a href="deck.pptx" download>Deck</a>')
+        self.serve({
+            ("GET", f"/api/frame/read/{SLUG}"): {"contract": "0.2.70", "capabilities": {}},
+            DEPLOY: {"slug": SLUG},
+        })
+        code, out, err = self.run_cli("publish", page, "--slug", SLUG, "--base-version", "v1",
+                                      "-q")
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), api.ARTIFACT_URL.format(slug=SLUG))
+        self.assertIn("--capability downloads", err)
+
+    def test_download_link_with_stored_downloads_capability_is_quiet(self):
+        page = self.write("dl.html", '<title>P</title><a download href="deck.pptx">Deck</a>')
+        self.serve({
+            ("GET", f"/api/frame/read/{SLUG}"): {"contract": "0.2.98",
+                                                 "capabilities": {"downloads": {}}},
+            DEPLOY: {"slug": SLUG},
+        })
+        code, _, err = self.run_cli("publish", page, "--slug", SLUG, "--base-version", "v1")
+        self.assertEqual(code, 0)
+        self.assertNotIn("warning", err)
+
+    def test_download_link_declared_on_this_publish_is_quiet(self):
+        page = self.write("dl.html", '<title>P</title><A HREF="x.csv" DOWNLOAD>CSV</A>')
+        self.serve({
+            ("GET", "/api/frame/contract/latest"): {"version": "0.2.98",
+                                                    "capabilities": ["downloads"]},
+            DEPLOY: {"slug": SLUG},
+        })
+        code, _, err = self.run_cli("publish", page, "--capability", "downloads", "-q")
+        self.assertEqual(code, 0)
+        self.assertNotIn("warning", err)
+
+    def test_new_artifact_with_download_link_warns(self):
+        page = self.write("dl.html", '<title>P</title><a class="b" download="r.pdf">PDF</a>')
+        self.serve({DEPLOY: {"slug": SLUG}})
+        code, _, err = self.run_cli("publish", page, "-q")
+        self.assertEqual(code, 0)
+        self.assertIn("File downloads are not available", err)
+
+    def test_page_without_download_link_never_reads_access(self):
+        self.serve({DEPLOY: {"slug": SLUG}})  # an access read would be an unexpected request
+        code, _, err = self.run_cli("publish", self.page(), "--slug", SLUG, "--base-version", "v1",
+                                    "-q")
+        self.assertEqual(code, 0)
+        self.assertNotIn("warning", err)
+
     def test_new_artifact_uses_latest_and_refuses_unknown(self):
         server = self.serve({
             ("GET", "/api/frame/contract/latest"): {"version": "0.2.76", "capabilities": ["db"]},

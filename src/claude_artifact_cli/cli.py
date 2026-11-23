@@ -206,6 +206,32 @@ def _contract_fields(client: api.FrameClient, slug: str | None, args) -> dict:
     return fields
 
 
+_DOWNLOAD_LINK = re.compile(rb"<a\b[^>]*\sdownload\b", re.IGNORECASE)
+
+
+def _warn_download_links(client: api.FrameClient, slug: str | None, page, meta: dict) -> None:
+    """Warn when a page offers files through <a download> without the downloads capability.
+
+    claude.ai blocks a plain download link inside an artifact ("File downloads are
+    not available for this artifact"); a page saves files through the downloads
+    capability instead.
+    """
+    if page is None or not _DOWNLOAD_LINK.search(page.data):
+        return
+    caps = meta.get("capabilities")
+    if caps is None and slug:
+        with contextlib.suppress(api.ApiError):
+            caps = client.access(slug).get("capabilities")
+    if isinstance(caps, dict) and "downloads" in caps:
+        return
+    _eprint(
+        "warning: the page has <a download> links, which claude.ai blocks inside an "
+        "artifact (\"File downloads are not available for this artifact\"). Publish with "
+        "--capability downloads and save the file from the click handler with "
+        "(await claude.use(\"downloads\")).save({filename, data})."
+    )
+
+
 def _copies(client: api.FrameClient, specs: list[list[str]]) -> list[api.Copy]:
     """--copy SOURCE PUB[=SRC]: files the server copies from another artifact."""
     copies = []
@@ -329,6 +355,7 @@ def cmd_publish(args) -> int:
 
     client = _client(args)
     meta.update(_contract_fields(client, slug, args))
+    _warn_download_links(client, slug, page, meta)
     copies = _copies(client, args.copy or [])
     result = client.publish(
         page=page,

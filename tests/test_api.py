@@ -253,6 +253,51 @@ class WireTest(ApiCase):
         )
         self.assertEqual(api.guess_content_type("x.unknownext"), "application/octet-stream")
 
+    def test_large_republish_references_stored_blobs_by_hash(self):
+        # A republish whose files are mostly unchanged: the preflight asks only
+        # for the new one. The stored ones must go by hash too, not inline,
+        # or the deploy body exceeds the server's cap (HTTP 413).
+        old = api.Asset("old.png", b"\x01" * 64, "image/png")
+        new = api.Asset("new.png", b"\x02" * 64, "image/png")
+        server = self.serve(
+            {
+                ("POST", "/api/frame/deploy/prepare"): {"slug": "s1", "missing": [new.sha256]},
+                ("POST", "/api/frame/upload"): {},
+                DEPLOY: {"slug": "s1"},
+            }
+        )
+        with mock.patch.object(api, "INLINE_BUDGET", 10):
+            self.client().publish(page(), extra=[old, new], slug="s1", base_version="v1")
+        upload = server.body("POST", "/api/frame/upload")
+        self.assertEqual([f["path"] for f in upload["files"]], ["new.png"])
+        manifest = server.body()["manifest"]
+        self.assertEqual(manifest["old.png"], {"sha256": old.sha256, "contentType": "image/png"})
+        self.assertEqual(manifest["new.png"], {"sha256": new.sha256, "contentType": "image/png"})
+        self.assertIn("content", manifest["index.html"])
+
+    def test_large_republish_with_nothing_missing_uploads_nothing(self):
+        big = api.Asset("big.png", b"\x00" * 64, "image/png")
+        server = self.serve(
+            {
+                ("POST", "/api/frame/deploy/prepare"): {"slug": "s1", "missing": []},
+                DEPLOY: {"slug": "s1"},
+            }
+        )
+        with mock.patch.object(api, "INLINE_BUDGET", 10):
+            self.client().publish(page(), extra=[big], slug="s1", base_version="v1")
+        self.assertNotIn(("POST", "/api/frame/upload"), server.paths())
+        self.assertEqual(
+            server.body()["manifest"]["big.png"], {"sha256": big.sha256, "contentType": "image/png"}
+        )
+
+    def test_malformed_missing_list_is_refused(self):
+        self.serve({("POST", "/api/frame/deploy/prepare"): {"slug": "s1", "missing": "all"}})
+        with mock.patch.object(api, "INLINE_BUDGET", 10), self.assertRaises(api.ApiError):
+            self.client().publish(
+                page(), extra=[api.Asset("b.png", b"\x00" * 64, "image/png")], slug="s1",
+                base_version="v1",
+            )
+
     def test_large_publish_stages_missing_blobs(self):
         big = api.Asset("big.png", b"\x00" * 64, "image/png")
         server = self.serve(

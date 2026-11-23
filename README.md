@@ -312,6 +312,31 @@ claude-artifact contract             # latest runtime contract and its capabilit
 claude-artifact contract --prompt    # the guide for page authors: claude.use(...), each capability's config
 ```
 
+#### Offering a file download
+
+claude.ai blocks a plain `<a href="report.pdf" download>` inside an artifact; the viewer sees "File downloads are not available for this artifact". A page offers a file through the `downloads` capability instead, and `publish` warns when the page has an `<a download>` link and neither this publish nor the artifact's stored declaration includes `downloads`.
+
+```bash
+claude-artifact publish ./site --capability downloads
+```
+
+```js
+// Ask on the viewer's click; keep the plain link as the fallback outside claude.ai.
+const downloads = await claude.use("downloads");          // null: unavailable
+link.addEventListener("click", async (event) => {
+  if (!downloads) return;                                 // let the plain link try
+  event.preventDefault();
+  const data = await (await fetch("deck.pptx")).blob();   // a file published with the page
+  try {
+    await downloads.save({ filename: "deck.pptx", data });
+  } catch (err) {
+    // the viewer cancelled, or the save failed: say so on the page
+  }
+});
+```
+
+The viewer confirms each save ("Let this artifact download a file?" with the name and size).
+
 ### Sharing and housekeeping
 
 ```bash
@@ -395,6 +420,9 @@ curl -fsSL https://raw.githubusercontent.com/nikships/claude-artifact-cli/main/s
 | `… names a document, not a collection` | A collection path needs an odd number of segments. Split off the last segment as the doc id. |
 | `contract … has no capability …` | A misspelled `--capability`. The error lists the valid names. |
 | `deleting … can't be undone; pass --yes` | `delete` needs `--yes`. |
+| `HTTP 413: Request exceeds the maximum size` on `publish` | 0.3.0 and earlier sent files the server already stored inline, so republishing a directory over ~15 MB failed. Upgrade: `claude-artifact update`. |
+| `warning: the page has <a download> links, which claude.ai blocks …` | See [Offering a file download](#offering-a-file-download). |
+| "File downloads are not available for this artifact" on claude.ai | The page uses a plain download link. See [Offering a file download](#offering-a-file-download). |
 
 ## The protocol
 
@@ -485,7 +513,7 @@ HTTP 409
 
 ### Large publishes
 
-Over ~15 MB inline, the client switches to `prepare` → `upload` → `deploy`. `prepare` takes `{slug?, shas:[…]}` and answers `{slug, missing:[…]}`. The missing blobs go to `/upload` in batches of at most 15 MB, and the final deploy references them by `sha256`: the hex sha256 of the raw file bytes.
+Over ~15 MB inline, the client switches to `prepare` → `upload` → `deploy`. `prepare` takes `{slug?, shas:[…]}` and answers `{slug, missing:[…]}`. The missing blobs go to `/upload` in batches of at most 15 MB, and the final deploy references every supporting file by `sha256` (the hex sha256 of the raw file bytes): the ones just uploaded and the ones `prepare` did not list, which the server already stores. The page itself always goes inline. Sending stored files inline instead puts a large republish over the deploy body cap (`HTTP 413: Request exceeds the maximum size`).
 
 ### Copying files from another artifact
 
