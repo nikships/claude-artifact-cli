@@ -1,14 +1,15 @@
 """Minimal client for the Claude Artifacts ("frame") API.
 
 Protocol reverse-engineered from the Claude Code CLI bundle (v2.1.273, checked
-against v2.1.287).
+against v2.1.332).
 
     POST {base}/api/frame/deploy/direct     publish
     POST {base}/api/frame/deploy/prepare    content-hash preflight (large publishes)
     POST {base}/api/frame/upload            stage blobs the preflight asked for
     GET  {base}/api/frame/{slug}?via=model_read   metadata + file manifest
     GET  {base}/api/frame/read/{slug}       ownership / sharing status
-    GET  {base}/api/frame/frames?limit=N    list artifacts
+    GET  {base}/api/frame/artifacts?rel=R&limit=N[&page_token=T]   list artifacts
+    GET  {base}/api/frame/frames?limit=N    list artifacts (older, unpaged)
 
     GET  https://{slug}.frame.claudeusercontent.com/_f/{ver}/_src/{path}?__frame_t={assetToken}
          published source bytes; /_f/{ver}/{path} is the served copy
@@ -22,12 +23,16 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.client
 import json
 import mimetypes
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,7 +40,7 @@ DEFAULT_BASE = "https://api.anthropic.com"
 ARTIFACT_URL = "https://claude.ai/code/artifact/{slug}"
 CONTENT_HOST = "https://{slug}.frame.claudeusercontent.com"
 OAUTH_BETA = "oauth-2025-04-20"
-CLIENT_VERSION = "2.1.287"
+CLIENT_VERSION = "2.1.332"
 
 SLUG_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
@@ -58,9 +63,92 @@ TEXT_TYPES = frozenset(
     }
 )
 
+# Content type by extension, as Claude Code assigns it; a file named with one
+# of these needs no explicit type. Python's mimetypes varies by platform and
+# version (.md, .webmanifest, .avif, .woff2), so this map is consulted first.
+EXTENSION_TYPES = {
+    ".html": "text/html",
+    ".css": "text/css",
+    ".js": "text/javascript",
+    ".mjs": "text/javascript",
+    ".json": "application/json",
+    ".map": "application/json",
+    ".geojson": "application/json",
+    ".webmanifest": "application/manifest+json",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".csv": "text/csv",
+    ".xml": "application/xml",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".avif": "image/avif",
+    ".ico": "image/vnd.microsoft.icon",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".pdf": "application/pdf",
+    ".wasm": "application/wasm",
+}
+
+# Content types artifacts serve. Claude Code refuses to publish anything else.
+SERVED_TYPES = TEXT_TYPES | frozenset(
+    {
+        "application/wasm",
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "image/avif",
+        "image/x-icon",
+        "image/vnd.microsoft.icon",
+        "font/woff",
+        "font/woff2",
+        "font/ttf",
+        "font/otf",
+        "application/font-woff",
+        "application/font-woff2",
+        "audio/mpeg",
+        "audio/ogg",
+        "audio/wav",
+        "audio/webm",
+        "video/mp4",
+        "video/webm",
+        "video/ogg",
+        "application/pdf",
+    }
+)
+
 # Inline bodies above this get split into prepare -> upload -> deploy.
 INLINE_BUDGET = 15 * 1024 * 1024
 UPLOAD_BATCH = 15 * 1024 * 1024
+
+# The server refuses a manifest of more than 256 entries in one request; a
+# bigger publish goes as several, each later one a patch onto the one before.
+# 255 matches Claude Code's own per-call limit.
+MANIFEST_MAX = 255
+
+# Publish retries, as Claude Code paces them.
+_SETTLE_RESENDS = 2  # 409 publish_settling: the first attempt is still being stored
+_SETTLE_WAIT_MAX = 20.0
+_BUSY_ATTEMPTS = 3  # 503: total attempts
+_BUSY_WAIT_MAX = 20.0
+_RATE_WAIT_MAX = 30.0  # 429 that is not a plan cap: one retry if Retry-After allows
+_PLAN_CAPS = {
+    "daily_new": "daily new-artifact limit for your plan reached - resets at UTC midnight",
+    "daily_pushes": "daily publish limit for your plan reached - resets at UTC midnight",
+    "rate_limited": "publish rate limit for your plan reached",
+    "contract_rollout": "this runtime contract isn't available to your plan yet",
+}
 
 # The served copy of the page carries the frame runtime, and can carry a
 # trailing comments script; the stored source has neither.
@@ -69,10 +157,21 @@ _COMMENTS_TAG = b'<script type="application/json" id="__frame_comments__">'
 
 
 class ApiError(RuntimeError):
-    def __init__(self, message: str, status: int | None = None, body: Any = None):
+    def __init__(
+        self,
+        message: str,
+        status: int | None = None,
+        body: Any = None,
+        retry_after: float | None = None,
+    ):
         super().__init__(message)
         self.status = status
         self.body = body
+        self.retry_after = retry_after
+
+
+class NetworkError(ApiError):
+    """The request got no HTTP answer: it may or may not have reached the server."""
 
 
 class ConflictError(ApiError):
@@ -120,7 +219,13 @@ class Asset:
 
     def wire(self) -> str:
         if self.content_type in TEXT_TYPES:
-            return self.data.decode("utf-8")
+            try:
+                return self.data.decode("utf-8")
+            except UnicodeDecodeError:
+                raise ApiError(
+                    f"{self.path} goes as {self.content_type}, which must be UTF-8, and it "
+                    "isn't; convert it, or give it a binary type"
+                ) from None
         return base64.b64encode(self.data).decode("ascii")
 
     def wire_bytes(self) -> int:
@@ -141,6 +246,11 @@ class Copy:
 
 
 def guess_content_type(path: str) -> str:
+    dot = path.rfind(".")
+    if dot > path.rfind("/"):
+        known = EXTENSION_TYPES.get(path[dot:].lower())
+        if known:
+            return known
     guessed, _ = mimetypes.guess_type(path)
     if guessed == "application/x-javascript":
         return "text/javascript"
@@ -378,11 +488,21 @@ class FrameClient:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 raw_reply = resp.read()
                 status = resp.status
+                reply_headers = getattr(resp, "headers", None)
         except urllib.error.HTTPError as exc:
-            raw_reply = exc.read()
             status = exc.code
+            reply_headers = getattr(exc, "headers", None)
+            try:
+                raw_reply = exc.read()
+            except (OSError, http.client.HTTPException):
+                # The status is known; only the error body was lost.
+                raw_reply = b""
         except urllib.error.URLError as exc:
-            raise ApiError(f"network error talking to {self.base}: {exc.reason}") from exc
+            raise NetworkError(f"network error talking to {self.base}: {exc.reason}") from exc
+        except (OSError, http.client.HTTPException) as exc:
+            # A reset, timeout or truncated body mid-response: the request may have landed.
+            raise NetworkError(f"network error talking to {self.base}: {exc!r}") from exc
+        retry_after = _retry_after(reply_headers)
 
         try:
             parsed = json.loads(raw_reply) if raw_reply else None
@@ -396,18 +516,44 @@ class FrameClient:
                 status,
                 parsed,
             )
-        if status == 409:
+        if status == 409 and "publish_settling" not in _codes(parsed):
             message = (
                 _describe_conflict(parsed)
                 if path.startswith("/api/frame/deploy/")
                 else _describe(status, parsed)
             )
-            raise ConflictError(message, status, parsed)
+            raise ConflictError(message, status, parsed, retry_after)
         if status >= 400:
-            raise ApiError(_describe(status, parsed), status, parsed)
+            raise ApiError(_describe(status, parsed), status, parsed, retry_after)
         return parsed
 
     # -- operations --------------------------------------------------------
+
+    def list_artifacts(
+        self, rel: str = "mine", limit: int = 200, page_token: str | None = None
+    ) -> tuple[list[dict], str | None]:
+        """One page of the gallery: (rows, next page token or None).
+
+        `rel` is mine, shared or all (favorited and template answer 403 to the
+        OAuth token: they serve browser sessions only). Rows carry
+        `slug` (the API's `id`) and `updatedAt` alongside the API's own fields.
+        """
+        query = {"rel": rel, "kind": "page,document", "sort": "last_viewed", "limit": str(limit)}
+        if page_token:
+            query["page_token"] = page_token
+        data = self._request("GET", "/api/frame/artifacts?" + urllib.parse.urlencode(query))
+        artifacts = (data.get("artifacts") or []) if isinstance(data, dict) else None
+        if not isinstance(artifacts, list):
+            raise ApiError("unexpected listing response shape", body=data)
+        rows = []
+        for row in artifacts:
+            if not isinstance(row, dict) or row.get("kind") not in ("page", "document"):
+                continue
+            rows.append(
+                {"slug": row.get("id"), "updatedAt": row.get("updated_at") or row.get("created_at"), **row}
+            )
+        token = data.get("next_page_token")
+        return redact(rows), token if isinstance(token, str) and token else None
 
     def list_frames(self, limit: int = 200) -> list[dict]:
         data = self._request("GET", f"/api/frame/frames?limit={int(limit)}")
@@ -511,15 +657,39 @@ class FrameClient:
 
     # -- database ----------------------------------------------------------
 
-    def db(self, slug: str, verb: str, args: dict) -> dict:
+    def db(
+        self,
+        slug: str,
+        verb: str,
+        args: dict,
+        as_level: str | None = None,
+        require_version: bool = False,
+    ) -> dict:
         """One artifact-database call: get, list, query, set, update, delete,
-        str_replace, batch or whoami."""
-        data = self._request(
-            "POST", "/api/frame/db/agent", {"slug": slug, "verb": verb, "args": args}
-        )
+        str_replace, batch or whoami.
+
+        `as_level` (view, interact, admin) acts with only that access level, to
+        check what the page's rules allow such a viewer. `require_version` has
+        the server refuse a write to an existing document that carries no
+        ifVersion.
+        """
+        body: dict[str, Any] = {"slug": slug, "verb": verb, "args": args}
+        if as_level:
+            body["asLevel"] = as_level
+        if require_version:
+            body["requireVersion"] = True
+        data = self._request("POST", "/api/frame/db/agent", body)
         if not isinstance(data, dict):
             raise ApiError("db returned an unexpected response", body=data)
         return redact(data)
+
+    def profiles(self, slug: str, ids: list[str]) -> dict:
+        """{id: {name?, guest?}} for the people (u_… ids) the artifact knows."""
+        data = self._request("POST", f"/api/frame/user/profiles/{_q(slug)}", {"ids": ids})
+        profiles = data.get("profiles") if isinstance(data, dict) else None
+        if not isinstance(profiles, dict):
+            raise ApiError("profiles returned an unexpected response", body=data)
+        return redact(profiles)
 
     # -- assets ------------------------------------------------------------
 
@@ -558,8 +728,12 @@ class FrameClient:
 
     # -- types and contracts -----------------------------------------------
 
-    def types(self) -> list[dict]:
-        data = self._request("GET", "/api/frame/types")
+    def types(self, query: str | None = None) -> list[dict]:
+        """Types this account can create from; `query` narrows to the best matches."""
+        path = "/api/frame/types"
+        if query:
+            path += "?" + urllib.parse.urlencode({"q": query})
+        data = self._request("GET", path)
         if isinstance(data, dict) and isinstance(data.get("types"), list):
             return redact(data["types"])
         raise ApiError("unexpected types response shape", body=data)
@@ -574,8 +748,12 @@ class FrameClient:
             raise ApiError(f"{path!r} is not a clean relative path")
         return redact(self._request("GET", f"/api/frame/types/{_q(slug)}/files/{quoted}"))
 
-    def type_instances(self, slug: str, limit: int = 50) -> list[dict]:
-        data = self._request("GET", f"/api/frame/types/{_q(slug)}/instances?limit={int(limit)}")
+    def type_instances(self, slug: str, limit: int = 50, rel: str = "all") -> list[dict]:
+        """Artifacts made from a type; `rel` is mine, shared or all."""
+        path = f"/api/frame/types/{_q(slug)}/instances?limit={int(limit)}"
+        if rel != "all":
+            path += f"&rel={_q(rel)}"
+        data = self._request("GET", path)
         if isinstance(data, dict) and isinstance(data.get("instances"), list):
             return redact(data["instances"])
         raise ApiError("unexpected instances response shape", body=data)
@@ -600,6 +778,15 @@ class FrameClient:
     def contract_prompt(self, version: str) -> str:
         data = self._request("GET", f"/api/frame/contract/{_q(version)}/prompt")
         return data if isinstance(data, str) else json.dumps(data, indent=2)
+
+    def contract_defs(self, version: str, name: str) -> str:
+        """TypeScript definitions for one capability (or `claude`, for claude.use)."""
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", name):
+            raise ApiError(f"{name!r} is not a capability name")
+        data = self._request("GET", f"/api/frame/contract/{_q(version)}/{name}.d.ts")
+        if not isinstance(data, str) or not data.strip():
+            raise ApiError(f"contract {version} returned no definitions for {name}")
+        return data
 
     def publish(
         self,
@@ -660,35 +847,149 @@ class FrameClient:
         staged_paths = {a.path for a in staged}
         for asset in assets:
             if asset.path in staged_paths:
-                manifest[asset.path] = {
-                    "sha256": asset.sha256,
-                    "contentType": asset.content_type,
-                }
+                key, value = "sha256", asset.sha256
             else:
-                manifest[asset.path] = {
-                    "content": asset.wire(),
-                    "contentType": asset.content_type,
-                }
+                key, value = "content", asset.wire()
+            manifest[asset.path] = {key: value, "contentType": asset.content_type}
         for copy in copies or []:
             manifest[copy.path] = {"sha256": copy.sha256, "contentType": copy.content_type}
         for path in removals or []:
             manifest[path] = None
 
-        body: dict[str, Any] = dict(meta or {})
-        body["manifest"] = manifest
-        body["mode"] = mode
-        if slug:
-            body["slug"] = slug
-        if base_version is not None:
-            body["baseVersion"] = base_version
-        if force:
-            body["force"] = True
-
-        on_progress("POST /api/frame/deploy/direct")
-        result = self._request("POST", "/api/frame/deploy/direct", body)
-        if not isinstance(result, dict) or "slug" not in result:
-            raise ApiError("deploy returned an incomplete response", body=result)
+        # The page goes first, so it is always in the first request.
+        entries = list(manifest.items())
+        parts = [
+            dict(entries[i : i + MANIFEST_MAX]) for i in range(0, len(entries), MANIFEST_MAX)
+        ] or [{}]
+        if len(parts) > 1:
+            on_progress(
+                f"{len(entries)} manifest entries - publishing in {len(parts)} requests "
+                f"of at most {MANIFEST_MAX}"
+            )
+        result: dict = {}
+        for index, part in enumerate(parts):
+            body: dict[str, Any] = dict(meta or {})
+            if index > 0:
+                # Later parts patch onto the version the previous part made.
+                body.pop("thumbnail", None)
+                body.pop("thumbnail_dark", None)
+                slug, mode, base_version, force = result["slug"], "patch", result.get("version"), False
+            body["manifest"] = part
+            body["mode"] = mode
+            if slug:
+                body["slug"] = slug
+            if base_version is not None:
+                body["baseVersion"] = base_version
+            if force:
+                body["force"] = True
+            try:
+                result = self._deploy(body, on_progress)
+            except ApiError as exc:
+                if index == 0:
+                    raise
+                raise type(exc)(
+                    f"{exc} - only {index} of {len(parts)} requests went through for "
+                    f"{ARTIFACT_URL.format(slug=result['slug'])}: version "
+                    f"{result.get('version')} has part of the files, and the failed request "
+                    "may have landed too. Check with `claude-artifact read "
+                    f"{result['slug']}`, then publish again with --slug {result['slug']} "
+                    "to send the rest",
+                    exc.status,
+                    exc.body,
+                    exc.retry_after,
+                ) from None
         return result
+
+    def _deploy(self, body: dict, on_progress: Callable[[str], None]) -> dict:
+        """POST /deploy/direct, retried the way Claude Code retries it.
+
+        Every send carries one attempt id. A send that gets no answer is sent
+        again once, marked as a re-send, so a publish that already landed is
+        answered (`replayed`) rather than repeated; the server takes a re-send
+        only for a named artifact. A 409 publish_settling (that earlier send
+        is still being stored), a 503, and a 429 that isn't a plan cap are
+        retried after the server's Retry-After.
+        """
+        attempt = str(uuid.uuid4())
+        resend = False
+        resent = settled = rate_retried = False
+        settle_count = 0
+        busy_attempts = 1
+        while True:
+            query = {"attempt_id": attempt}
+            if resend:
+                query["resend"] = "1"
+            path = "/api/frame/deploy/direct?" + urllib.parse.urlencode(query)
+            on_progress("POST /api/frame/deploy/direct" + (" (re-send)" if resend else ""))
+            try:
+                result = self._request("POST", path, body)
+            except NetworkError as exc:
+                if resent or not body.get("slug"):
+                    where = (
+                        f"`claude-artifact read {body['slug']}` shows whether it did"
+                        if body.get("slug")
+                        else "`claude-artifact list` shows it if it did"
+                    )
+                    raise NetworkError(
+                        f"{exc} - the publish may or may not have landed; {where}"
+                    ) from None
+                resent = resend = True
+                on_progress("no answer - re-sending once, marked as a re-send")
+                continue
+            except ApiError as exc:
+                codes = _codes(exc.body)
+                if exc.status == 409 and "publish_settling" in codes:
+                    if settle_count >= _SETTLE_RESENDS:
+                        raise ApiError(
+                            "HTTP 409: an earlier send of this publish reached claude.ai and "
+                            "is still being stored; check with `claude-artifact read` in a "
+                            "moment before publishing again",
+                            exc.status,
+                            exc.body,
+                        ) from None
+                    settle_count += 1
+                    settled = True
+                    wait = min(exc.retry_after if exc.retry_after is not None else 2.0,
+                               _SETTLE_WAIT_MAX)
+                    on_progress(f"an earlier send is still being stored - re-sending in {wait:g}s")
+                    time.sleep(wait)
+                    continue
+                if (
+                    exc.status == 503
+                    and busy_attempts < _BUSY_ATTEMPTS
+                    and not _stranded(exc.body)
+                ):
+                    busy_attempts += 1
+                    floor = 5.0 * (busy_attempts - 1)
+                    wait = min(max(exc.retry_after or 0.0, floor), _BUSY_WAIT_MAX)
+                    # The refused send may still have landed: re-send where allowed.
+                    resend = resend or bool(body.get("slug"))
+                    on_progress(f"HTTP 503 - retrying in {wait:g}s "
+                                f"(attempt {busy_attempts} of {_BUSY_ATTEMPTS})")
+                    time.sleep(wait)
+                    continue
+                if exc.status != 429:
+                    raise
+                cap = next((c for c in codes if c in _PLAN_CAPS), None)
+                if cap:
+                    detail = exc.body.get("message") if isinstance(exc.body, dict) else None
+                    raise ApiError(
+                        f"HTTP 429: {_PLAN_CAPS[cap]}" + (f" ({detail})" if detail else ""),
+                        exc.status,
+                        exc.body,
+                    ) from None
+                wait = exc.retry_after
+                if not rate_retried and wait is not None and wait <= _RATE_WAIT_MAX:
+                    rate_retried = True
+                    on_progress(f"HTTP 429 - retrying in {wait:g}s")
+                    time.sleep(wait)
+                    continue
+                raise
+            if not isinstance(result, dict) or "slug" not in result:
+                raise ApiError("deploy returned an incomplete response", body=result)
+            if result.get("replayed") and (resent or settled):
+                on_progress("the earlier send had landed; the server answered it")
+            return result
 
     # -- large-publish path ------------------------------------------------
 
@@ -783,6 +1084,34 @@ def _describe_conflict(body: Any) -> str:
         "hand. Then publish again (a page with --base-version set to the live version), "
         "or pass --force to discard it."
     )
+
+
+def _retry_after(headers: Any) -> float | None:
+    """Retry-After in seconds (delta form only), or None."""
+    try:
+        value = headers.get("Retry-After") if headers is not None else None
+        return max(0.0, float(value)) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _codes(body: Any) -> set[str]:
+    """Every machine-readable code an error body carries: reason, error, error.code."""
+    found: set[str] = set()
+    if isinstance(body, dict):
+        for key in ("reason", "error", "code"):
+            value = body.get(key)
+            if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", value):
+                found.add(value)
+        err = body.get("error")
+        if isinstance(err, dict) and isinstance(err.get("code"), str):
+            found.add(err["code"])
+    return found
+
+
+def _stranded(body: Any) -> bool:
+    """A 503 naming the artifact: the publish was cut off partway; don't resend blindly."""
+    return isinstance(body, dict) and isinstance(body.get("slug"), str)
 
 
 def error_code(body: Any) -> str | None:

@@ -46,7 +46,7 @@ claude-artifact pull SLUG_OR_URL [DIR] [--force] [-q]
                                             download the artifact's files into DIR
 claude-artifact status [PATH] [--slug S | --url U]
                                             compare local files with what's live
-claude-artifact list [--scope mine|shared|all] [--limit N]
+claude-artifact list [--scope mine|shared|all] [--pinned] [--type TITLE] [--limit N] [--page-token T]
 claude-artifact read SLUG_OR_URL [-o FILE]  metadata + published file manifest
 claude-artifact read SLUG_OR_URL --path P [--path P ... --out-dir DIR]
                                             a published file's exact bytes
@@ -56,18 +56,18 @@ claude-artifact pin|unpin SLUG_OR_URL
 claude-artifact delete SLUG_OR_URL --yes    delete for everyone; no undo
 claude-artifact share SLUG_OR_URL [--private | --org | --add UUID ... [--access view|comment] | --remove UUID ...]
 
-claude-artifact comments list SLUG_OR_URL [--all | --awaiting] [--full]
-claude-artifact comments reply SLUG_OR_URL THREAD TEXT|- [--id UUID]
+claude-artifact comments list SLUG_OR_URL [--all | --awaiting | --thread ID] [--full]
+claude-artifact comments reply SLUG_OR_URL THREAD TEXT|- [--id UUID] [--allow-duplicate]
 claude-artifact comments resolve SLUG_OR_URL THREAD ...
 claude-artifact watch SLUG_OR_URL [--interval S] [--count N] [--no-comments]
 
-claude-artifact db whoami|get|list|query|set|update|delete|edit|batch SLUG_OR_URL ...
+claude-artifact db whoami|get|list|query|set|update|delete|edit|batch|profiles SLUG_OR_URL ...
 claude-artifact assets list|upload|get|delete|copy SLUG_OR_URL ...
 
-claude-artifact types list | show TYPE | read TYPE PATH | instances TYPE
+claude-artifact types list [--query Q] | show TYPE | read TYPE PATH | instances TYPE [--scope S]
 claude-artifact create TYPE [--title T]     new artifact from a type (slides, docs, ...)
-claude-artifact contract [VERSION] [--prompt]
-                                            runtime capabilities and the page-author guide
+claude-artifact contract [VERSION] [--prompt | --defs [NAME ...] [--out-dir DIR]]
+                                            runtime capabilities, the page-author guide, .d.ts types
 
 claude-artifact whoami                      check that auth works
 claude-artifact update                      upgrade to the latest release now
@@ -123,11 +123,18 @@ claude-artifact publish index.html --slug <slug> \
 | `--clear-capabilities` | Drop every declared capability. |
 | `--contract VERSION` | Pin the runtime contract, or `latest` to upgrade. Default: the artifact's stored contract; a declaration on an artifact without one uses the latest. |
 | `--copy SOURCE PUB[=SRC]` | Have the server copy published file `SRC` (default `PUB`) from artifact `SOURCE` into this one at `PUB`. Nothing is downloaded or re-uploaded. Repeatable. The server copies scripts, styles, data, fonts and images, not HTML or XML. |
+| `--content-type PUB=TYPE` | Content type for a supporting file whose extension doesn't give one, e.g. `notes.log=text/plain`. Repeatable. Types come from Claude Code's extension map first (`.md`, `.webmanifest`, `.avif`, `.woff2`, …), then Python's `mimetypes`. A file that would go as a type artifacts don't serve (such as `application/octet-stream`) gets a warning. |
+| `--edit OLD NEW` | Replace `OLD` with `NEW` in the page before publishing, then save the page with the change, like the Artifact tool's `edits`. `OLD` must occur exactly once (after the edits before it), or nothing is published. Repeatable, applied in order. |
+| `--pin` | Pin the artifact to your sidebar once it is published. |
 | `--note TEXT` | A note recorded with this version; `versions` shows it. |
 | `--thumbnail IMAGE`, `--thumbnail-dark IMAGE` | Gallery thumbnails. |
 | `-q`, `--quiet` | Print only the URL. |
 
 `--json` prints the deploy response with the artifact `url` added: `{"url", "slug", "version", …}`.
+
+A publish of more than 255 files (manifest entries, removals included) goes as several requests: the first carries the page and the first 255, and each later one patches onto the version the one before made. The server refuses more than 256 entries in one request. If a later request fails, the error says which version is live with part of the files; publish again to send the rest.
+
+A publish that gets no answer (a dropped connection, a timeout) is sent once more, marked as a re-send, so one that already landed is answered rather than applied twice. This works for updates; a new artifact isn't re-sent blind, and the error says to check `claude-artifact list`. A `503`, a `409` saying an earlier send is still being stored, and a short `429` are retried after the server's `Retry-After`; a daily plan cap is reported, not retried.
 
 ### Publish a directory
 
@@ -210,6 +217,10 @@ Either way, `--force` publishes anyway and discards the other version.
 
 ```bash
 claude-artifact list --scope shared
+claude-artifact list --type docs            # made from a type; --type page for plain pages
+claude-artifact list --pinned --scope all
+claude-artifact list --limit 50             # counts rows after filters; stderr says `more: --page-token T` when more are left
+claude-artifact list --page-token T         # the next page
 claude-artifact read <slug-or-url>          # title, version, role, file manifest
 claude-artifact read <slug> -o meta.json   # also save the metadata JSON
 
@@ -221,7 +232,9 @@ claude-artifact read <slug> --path index.html --path app.css --out-dir ./out   #
 
 `read --path P` prints the published file's exact bytes to stdout instead, checked against the manifest's sha256. Repeat `--path` with `--out-dir DIR` to save several files under `DIR` at their published paths; it prints each saved path. `--path` doesn't combine with `--json` or `-o`, more than one `--path` needs `--out-dir`, and `--out-dir` needs `--path`.
 
-`read` also shows the artifact's runtime contract and declared capabilities. `list --pinned` shows only pinned artifacts.
+`read` also shows the artifact's runtime contract and declared capabilities.
+
+`list` pages through the gallery, most recently viewed first, and prints slug, date, type (Docs, Slides, … or blank for a plain page) and title. `--json` rows carry `slug` and `updatedAt` alongside the API's own fields (`id`, `updated_at`, `type_title`, `starred`, `audience`, …). `--pinned` keeps starred rows. If the paged listing isn't served, it falls back to the older unpaged one.
 
 Never WebFetch or curl a `claude.ai` artifact URL: it is a login-walled app shell and returns no page content.
 
@@ -235,9 +248,9 @@ echo "Long answer" | claude-artifact comments reply <slug> <thread> -
 claude-artifact comments resolve <slug> <thread>
 ```
 
-`list` shows open threads; `--all` adds resolved ones and `--full` keeps long comments whole. Each thread prints its id, its state (`resolved`, `sent to Claude`, `awaiting Claude`), what it is anchored to, and every comment.
+`list` shows open threads; `--all` adds resolved ones, `--thread ID` shows one thread (open or resolved), and `--full` keeps long comments whole. Each thread prints its id, its state (`resolved`, `sent to Claude`, `awaiting Claude`), what it is anchored to, and every comment.
 
-`reply` posts **as Claude**, and only on a thread a person sent to Claude ("Send to Claude" on the artifact's page); anything else is refused, as it is for Claude Code's Artifact tool. When the thread is waiting on Claude, the reply marks that request answered. Each reply carries a client id (`--id`, default a fresh UUID); resending the same id posts nothing new, so a retry after a network error is safe. `resolve` works on the same threads. Starting a thread, and replying or resolving as yourself, need a claude.ai browser session: do those on the artifact's page.
+`reply` posts **as Claude**, and only on a thread a person sent to Claude ("Send to Claude" on the artifact's page); anything else is refused, as it is for Claude Code's Artifact tool. When the thread is waiting on Claude, the reply marks that request answered. A reply holds at most 4096 bytes of UTF-8. When a Claude reply already answers every request on the thread, another is refused as a likely duplicate; pass `--allow-duplicate` for a deliberate follow-up. Each reply carries a client id (`--id`, default a fresh UUID); resending the same id posts nothing new, so a retry after a network error is safe (an explicit `--id` skips the duplicate check). `resolve` works on the same threads. Starting a thread, and replying or resolving as yourself, need a claude.ai browser session: do those on the artifact's page.
 
 ### Watch
 
@@ -262,6 +275,10 @@ claude-artifact db edit   <slug> notes n1 --field body --old "teh" --new "the" -
 claude-artifact db delete <slug> tasks t1
 claude-artifact db batch  <slug> @writes.json    # [{"op":"set","collection":"tasks","doc_id":"t2","data":{…}}, …]
 claude-artifact db whoami <slug>                 # your id, as in data/users/<id>
+claude-artifact db profiles <slug> u_… u_…       # display names for person ids in the data
+claude-artifact db get  <slug> tasks t1 --as-level view       # what a view-only viewer sees
+claude-artifact db list <slug> tasks --all --out-dir ./dump   # each as ./dump/tasks/<id>.json
+claude-artifact db set  <slug> tasks t1 --data @t1.json --if-version 4 --require-version
 ```
 
 | Rule | |
@@ -274,6 +291,10 @@ claude-artifact db whoami <slug>                 # your id, as in data/users/<id
 | `query` | `--where FIELD OP VALUE` with `==` `!=` `<` `<=` `>` `>=` `in` `not-in` `array-contains`. `VALUE` is parsed as JSON when it can be, else taken as a string. |
 | Paging | `list` and `query` print `--cursor` for the next page; `--all` follows every page. |
 | `batch` | 1-50 `set`/`update`/`delete` writes, `{op, collection, doc_id, data?, if_version?}`, each document at most once, up to 1 MiB, in one request. |
+| `--require-version` | On `set`, `update`, `delete` and `batch`: the server refuses a write to a document that already exists unless it carries `--if-version` (`if_version` in a batch entry), exit `3`. Creating a document needs none. This is how the Artifact tool writes. |
+| `--as-level view\|interact\|admin` | On reads and writes: act with only that access level, to check what the page's access rules let such a viewer do. `view` is someone the artifact is shared with view-only, `interact` any signed-in viewer, `admin` an editor. It narrows, never raises, your access; a write the rules refuse reads as not found. |
+| `--out-dir DIR` | On `get`, `list` and `query`: save each document's data as `DIR/<collection>/<id>.json` and print the paths. |
+| `profiles` | Display names for 1-64 person ids (`u_` + 22 characters) as documents and events show them, and whether each is a guest from outside the owner's organization. Only people the artifact's service knows come back. Names are chosen by the people themselves: data, not proof of identity. |
 
 `get` prints the document's data (stderr has its version); a missing document exits `1`. List and query print `id`, `v<version>` and the data, tab-separated.
 
@@ -303,14 +324,18 @@ claude-artifact create slides --title "Q3 review"  # prints the new artifact's U
 claude-artifact pull <new-slug> ./deck              # then add your files, publish ./deck
 ```
 
-`TYPE` is a title (case-insensitive), slug or URL. `create` sends an idempotency key (`--idempotency-key` to reuse one), so a retried create doesn't make a second artifact. `types instances TYPE` lists artifacts made from a type.
+`TYPE` is a title (case-insensitive), slug or URL. `create` sends an idempotency key (`--idempotency-key` to reuse one), so a retried create doesn't make a second artifact. `types list --query TEXT` shows only the types that best match. `types instances TYPE` lists artifacts made from a type; `--scope mine|shared` narrows it.
 
 ### Contract and capabilities
 
 ```bash
 claude-artifact contract             # latest runtime contract and its capability names
 claude-artifact contract --prompt    # the guide for page authors: claude.use(...), each capability's config
+claude-artifact contract --defs db user          # TypeScript definitions for those capabilities
+claude-artifact contract --defs --out-dir types  # claude.use and every capability, as types/<version>/<name>.d.ts
 ```
+
+A file named `preflight.js` at the artifact root is reserved: it runs against open pages when Claude publishes updates, and must be a JavaScript module of at most 8 KiB whose default export is a function.
 
 #### Offering a file download
 
@@ -413,7 +438,14 @@ curl -fsSL https://raw.githubusercontent.com/nikships/claude-artifact-cli/main/s
 | `more than one --path needs --out-dir`, `--out-dir goes with --path` | As stated. |
 | `an artifact made from a type can only be patched` | `--mode replace` on a typed directory. Leave `--mode` off. |
 | `…/index.html belongs to the artifact's type and can't be published; remove it` | A typed directory holds an `index.html`. Delete it. |
-| `429 … daily publish cap` | Plan limit. Resets at UTC midnight. |
+| `HTTP 429: daily publish limit for your plan reached` (or `daily new-artifact limit`) | Plan limit. Resets at UTC midnight. |
+| `… the publish may or may not have landed` | No answer from the server, even after a re-send. `claude-artifact read SLUG` (or `list` for a new artifact) shows whether it did. |
+| `only N of M requests went through, so version … is live with part of the files` | A publish of more than 255 files failed partway. Publish again. |
+| `warning: … goes as application/octet-stream, which artifacts don't serve` | No known extension. Rename the file or pass `--content-type PATH=TYPE` (`text/plain` for source, config or logs). |
+| `--edit N: '…' occurs more than once in …` / `is not in …` | The text to replace must occur exactly once in the page. Nothing was published. |
+| `a Claude reply already answers every request on this thread` | `comments reply` on an answered thread. Pass `--allow-duplicate` for a real follow-up. |
+| `the document already exists … --require-version needs --if-version`, exit code `3` | `db get` it, then write with `--if-version` set to its version. |
+| `not found at --as-level …` | Nothing there, or the page's rules refuse it at that level. |
 | `Claude can only reply on a thread a person sent to Claude` | `comments reply`/`resolve` on a thread without "Send to Claude". Ask the person to send it to Claude, or answer on the page. |
 | `this artifact's published version doesn't declare the db capability` | Republish with `--capability db --capability user`. |
 | `the document changed since --if-version`, exit code `3` | Someone wrote the document since you read it. `db get` it again and redo the write. |
@@ -426,15 +458,16 @@ curl -fsSL https://raw.githubusercontent.com/nikships/claude-artifact-cli/main/s
 
 ## The protocol
 
-Reverse-engineered from the Claude Code CLI v2.1.273 binary and checked against v2.1.287, where artifacts are called *frames*. API calls go to `api.anthropic.com`, even though the artifact is served from `claude.ai`; file bytes come from a per-artifact content host.
+Reverse-engineered from the Claude Code CLI v2.1.273 binary and checked against v2.1.332, where artifacts are called *frames*. API calls go to `api.anthropic.com`, even though the artifact is served from `claude.ai`; file bytes come from a per-artifact content host.
 
 ```
-POST /api/frame/deploy/direct     publish
+POST /api/frame/deploy/direct?attempt_id=<uuid>[&resend=1]     publish
 POST /api/frame/deploy/prepare    content-hash preflight (bodies over ~15 MB)
 POST /api/frame/upload            stage blobs the preflight asked for
 GET  /api/frame/{slug}?via=model_read   boot: metadata, file manifest, assetToken
 GET  /api/frame/read/{slug}       ownership, stored contract and capabilities
-GET  /api/frame/frames?limit=N    list
+GET  /api/frame/artifacts?rel=R&kind=page,document&sort=last_viewed&limit=N[&page_token=T]   list
+GET  /api/frame/frames?limit=N    list (older, unpaged; the fallback)
 GET  /api/frame/versions/{slug}   version history
 POST /api/frame/retitle/{slug}    rename                    {"title"}
 POST|DELETE /api/frame/favorite/{slug}   pin / unpin
@@ -445,11 +478,14 @@ GET  /api/frame/comments/{slug}?names=1                     threads
 POST /api/frame/comments/{slug}/{thread}                    reply as Claude
 POST /api/frame/comments/{slug}/{thread}/session-resolve    resolve
 POST /api/frame/db/agent                                    database
+POST /api/frame/user/profiles/{slug}                        people's display names
 POST /api/frame/blob/{slug}/agent-upload|agent-list|agent-copy, /{id}/agent-delete   assets
 
-GET  /api/frame/types[/{slug}[/files/{path}|/instances]]    types
+GET  /api/frame/types[?q=TEXT]                              types (q: best matches)
+GET  /api/frame/types/{slug}[/files/{path}|/instances?limit=N[&rel=mine|shared]]
 POST /api/frame/types/{slug}/create?idempotency_key=K       new artifact from a type
 GET  /api/frame/contract/{latest|version}[/prompt]          runtime contract
+GET  /api/frame/contract/{version}/{claude|capability}.d.ts TypeScript definitions
 
 GET  https://{slug}.frame.claudeusercontent.com/_f/{ver}/_src/{path}?__frame_t=<assetToken>
                                   published source bytes (see Reading files)
@@ -470,7 +506,7 @@ Accept: application/json, application/vnd.ant.frame-refusal+json
 X-Frame-CP: go
 X-Frame-Surface: code
 X-Frame-Platform: cli
-X-Frame-Client-Version: 2.1.287
+X-Frame-Client-Version: 2.1.332
 ```
 
 Only `Authorization` and `anthropic-beta` are load-bearing.
@@ -501,6 +537,10 @@ A manifest value with `content` inlines the file; one with `sha256` references a
 Optional deploy fields: `description`, `icon`, `label`, `note`, `thumbnail` and `thumbnail_dark` (base64 images), and `contract` with `capabilities` (`{"db": {}, "user": {}}`). `capabilities` requires `contract` (`HTTP 400: capabilities requires contract`); a deploy without `capabilities` keeps the stored declaration, and `{}` clears it. A patch needs a non-empty manifest.
 
 Response: `{"slug", "version", "manifest", "history", "contract", "capabilities", …}`. The page lives at `https://claude.ai/code/artifact/<slug>`.
+
+**Attempts and retries.** Every send of one publish carries the same `attempt_id` (a UUID) in the query. A send that got no answer goes again with `&resend=1`; if the first one landed, the server answers it with `"replayed": true` instead of applying it again. A re-send must name the artifact (`HTTP 400: a re-send must name the artifact (slug)`), so it only helps an update. `409` with `"reason": "publish_settling"` means an earlier send landed and its content is still being stored: re-send after `Retry-After` (Claude Code: at most twice, waits capped at 20 s). A `503` is retried up to 3 attempts with growing waits, unless its body names the artifact (`{"slug", "live"?}`: the publish was cut off partway). A `429` whose `error` is `daily_new`, `daily_pushes`, `rate_limited` or `contract_rollout` is a plan cap; any other `429` is retried once if `Retry-After` is at most 30 s.
+
+**Manifest size.** One request takes at most 256 manifest entries (`HTTP 400: manifest exceeds 256 entries in one request`); send more as patches, each with `baseVersion` set to the version the previous request returned.
 
 **Modes and conflicts.** `replace` makes the manifest the whole artifact; `patch` overlays it onto `baseVersion`, keeping paths it doesn't name. Both modes honor `baseVersion`: if the live version is newer, the deploy is refused with
 
@@ -540,7 +580,15 @@ The OAuth token can reply and resolve only on threads with `claude_activated_at`
 | `str_replace` | `{"path", "field", "old_str", "new_str", "replace_all"?, "idem": <16 random bytes, base64url>, "ifVersion"?}` |
 | `batch` | `{"ops": [{"op", …the args above}]}` → `{results: [{version?}]}` |
 
-`op` is `eq ne lt lte gt gte in not-in array-contains`. Writes answer `{version, usage}`. Errors are `{"error": {"code", "message", …}}`: `404 not_declared` when the published version doesn't declare `db`, `409 version_mismatch` (with the current `version`) when `ifVersion` is stale.
+`op` is `eq ne lt lte gt gte in not-in array-contains`. Writes answer `{version, usage}`.
+
+Two optional top-level fields sit beside `slug`, `verb` and `args`: `"asLevel": "view"|"interact"|"admin"` acts with only that access level (the answer echoes `asLevel`; a refused read or write answers `404 {"error": {"code": "not-found", "asLevel"}}`), and `"requireVersion": true` refuses a write to an existing document without `ifVersion` (`409 {"error": {"code": "version_mismatch", "required": true, "version"}}`).
+
+`POST /api/frame/user/profiles/{slug}` with `{"ids": ["u_…", …]}` (1-64) answers `{"profiles": {id: {"name"?, "guest"?}}}`, only for the ids the artifact's service knows; `403 {"error": "not_declared"}` when the published version doesn't declare `user`.
+
+### Listing
+
+`GET /api/frame/artifacts` takes `rel` (`mine`, `shared` or `all`; `favorited` and `template` answer `403 artifacts listing serves session-credential callers only` to the OAuth token), `kind=page,document`, `sort=last_viewed`, `limit` and `page_token`, and answers `{"artifacts": [{kind, id, rel, title, updated_at?, created_at, type_title?, plain_page?, starred?, audience, owner_account, …}], "next_page_token"?}`. Claude Code reads it first and falls back to `GET /api/frame/frames?limit=N`, which has no paging. Errors are `{"error": {"code", "message", …}}`: `404 not_declared` when the published version doesn't declare `db`, `409 version_mismatch` (with the current `version`) when `ifVersion` is stale.
 
 ### Assets
 
@@ -568,6 +616,7 @@ The `assetToken` is redacted from every output and never written to disk.
 
 - **Starting comment threads, or commenting as yourself.** Those routes need a claude.ai browser session.
 - **Artifacts shared from other organizations in `list`.** `GET /frames/external` needs a browser session.
+- **Listing pinned or template artifacts server-side.** `rel=favorited` and `rel=template` need a browser session; `list --pinned` filters the `starred` flag instead.
 - **Push notifications.** Claude Code's watch subscribes a webhook (`/subscribe/{slug}`) minted by its own session; `watch` polls instead.
 - **Sharing by email.** The route takes account UUIDs; Claude Code resolves names on an approval card the CLI has no equivalent of.
 

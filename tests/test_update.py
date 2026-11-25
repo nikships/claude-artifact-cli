@@ -270,7 +270,7 @@ class CliTest(UpdateCase):
     def test_commands_check_and_never_change_their_outcome(self):
         self.fetch.return_value = "1.1.0"
         self.patch(cli.auth, "get_token", return_value="test-token")
-        self.patch(cli.api.FrameClient, "_request", return_value=[])
+        self.patch(cli.api.FrameClient, "_request", return_value={"artifacts": []})
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             self.assertEqual(cli.main(["list"]), 0)
@@ -282,7 +282,7 @@ class CliTest(UpdateCase):
         self.patch(update, "start_check", side_effect=TypeError("boom"))
         self.patch(update, "finish_check", side_effect=TypeError("boom"))
         self.patch(cli.auth, "get_token", return_value="test-token")
-        self.patch(cli.api.FrameClient, "_request", return_value=[])
+        self.patch(cli.api.FrameClient, "_request", return_value={"artifacts": []})
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(cli.main(["list"]), 0)
@@ -292,7 +292,7 @@ class CliTest(UpdateCase):
         self.fetch.return_value = "1.1.0"
         self.popen.side_effect = OSError("no")
         self.patch(cli.auth, "get_token", return_value="test-token")
-        self.patch(cli.api.FrameClient, "_request", return_value=[])
+        self.patch(cli.api.FrameClient, "_request", return_value={"artifacts": []})
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(cli.main(["list"]), 0)
 
