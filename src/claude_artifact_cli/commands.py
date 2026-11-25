@@ -234,6 +234,8 @@ def _author(comment: dict, names: dict) -> str:
 
 def _filter_threads(data: dict, args) -> list[dict]:
     threads = [t for t in data.get("threads") or [] if isinstance(t, dict)]
+    if getattr(args, "thread", None):
+        return [t for t in threads if t.get("id") == args.thread]
     if args.awaiting:
         return [t for t in threads if awaiting_claude(t)]
     if not args.all:
@@ -245,6 +247,8 @@ def cmd_comments_list(args) -> int:
     slug = api.slug_from(args.slug)
     data = _client(args).comments(slug)
     threads = _filter_threads(data, args)
+    if not threads and getattr(args, "thread", None):
+        raise api.ApiError(f"no comment thread {args.thread} on this artifact", 404)
     if args.json:
         _print_json({**data, "threads": threads})
         return 0
@@ -275,11 +279,31 @@ def cmd_comments_list(args) -> int:
     return 0
 
 
+REPLY_MAX_BYTES = 4096
+
+
+def answered(thread: dict) -> bool:
+    """A Claude reply already stands after every request a person sent to Claude."""
+    replied = False
+    for comment in thread.get("comments") or []:
+        if _is_claude(comment):
+            replied = True
+        elif comment.get("to_claude_at"):
+            replied = False
+    return replied
+
+
 def cmd_comments_reply(args) -> int:
     slug = api.slug_from(args.slug)
     text = _read_text(args.text).strip()
     if not text:
         raise SystemExit("error: the reply is empty")
+    size = len(text.encode("utf-8"))
+    if size > REPLY_MAX_BYTES:
+        raise SystemExit(
+            f"error: the reply is {size} bytes; a comment holds at most {REPLY_MAX_BYTES} "
+            "bytes of UTF-8"
+        )
     client_id = args.id or str(uuid.uuid4())
     client = _client(args)
     thread = next(
@@ -293,6 +317,13 @@ def cmd_comments_reply(args) -> int:
             "Claude can only reply on a thread a person sent to Claude (\"Send to Claude\" "
             "on the artifact's page); this one wasn't",
             403,
+        )
+    # An explicit --id is a retry of an earlier post, which the server dedupes.
+    if not args.id and not args.allow_duplicate and answered(thread):
+        raise api.ApiError(
+            "a Claude reply already answers every request on this thread, so this looks "
+            "like a duplicate; pass --allow-duplicate for a deliberate follow-up that adds "
+            "something new, or --id with the earlier reply's id to retry that post"
         )
     # Marks the person's request answered, as the Artifact tool does.
     result = client.reply(
@@ -352,9 +383,17 @@ def _doc_id(value: str) -> str:
 class _Db:
     """Resolves `data/users/me` to the caller's own id once per command."""
 
-    def __init__(self, client: api.FrameClient, slug: str):
+    def __init__(
+        self,
+        client: api.FrameClient,
+        slug: str,
+        as_level: str | None = None,
+        require_version: bool = False,
+    ):
         self.client = client
         self.slug = slug
+        self.as_level = as_level
+        self.require_version = require_version
         self._me: str | None = None
 
     def collection(self, value: str) -> str:
@@ -369,10 +408,25 @@ class _Db:
         return f"{self.collection(collection)}/{_doc_id(doc)}"
 
     def call(self, verb: str, args: dict) -> dict:
+        writes = verb in ("set", "update", "delete", "batch")
         try:
-            return self.client.db(self.slug, verb, args)
+            return self.client.db(
+                self.slug,
+                verb,
+                args,
+                as_level=self.as_level if verb != "whoami" else None,
+                require_version=self.require_version and writes,
+            )
         except api.ApiError as exc:
             code = api.error_code(exc.body)
+            if self.as_level and code in ("not-found", "not_found"):
+                raise api.ApiError(
+                    f"not found at --as-level {self.as_level}: either nothing is there, or the "
+                    "page's access rules refuse this to such a viewer (a refused write reads as "
+                    "not found)",
+                    exc.status,
+                    exc.body,
+                ) from None
             if code == "not_declared":
                 raise api.ApiError(
                     "this artifact's published version doesn't declare the db capability - "
@@ -381,14 +435,21 @@ class _Db:
                     exc.body,
                 ) from None
             if code == "version_mismatch":
-                live = (exc.body.get("error") or {}).get("version")
+                err = exc.body.get("error") or {}
+                live = err.get("version")
                 where = f" (it is at version {live})" if live is not None else ""
-                raise api.ConflictError(
-                    f"the document changed since --if-version{where}; nothing was written. "
-                    "Read it again and retry against what it holds now",
-                    exc.status,
-                    exc.body,
-                ) from None
+                if err.get("required"):
+                    message = (
+                        f"the document already exists{where} and --require-version needs "
+                        "--if-version on a write to it (in a batch, if_version on that entry); "
+                        "nothing was written. Read it and resend with the version you read"
+                    )
+                else:
+                    message = (
+                        f"the document changed since --if-version{where}; nothing was "
+                        "written. Read it again and retry against what it holds now"
+                    )
+                raise api.ConflictError(message, exc.status, exc.body) from None
             raise
 
 
@@ -427,23 +488,111 @@ def _where_value(raw: str) -> Any:
         return raw
 
 
+_PERSON_RE = re.compile(r"^u_[A-Za-z0-9_-]{22}$")
+_WINDOWS_UNSAFE = re.compile(
+    r'[<>:"|?*]|[. ]$|^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(\..*)?$', re.IGNORECASE
+)
+
+
+def _safe_dest(root: Path, parts: list[str]) -> Path:
+    """root/parts..., refusing unsafe segments, symlinks and anything outside root.
+
+    Segments can come from the server (a document id, the id `me` resolves to,
+    a contract version), so each is checked before anything is written.
+    """
+    dest = root
+    for part in parts:
+        if not _SEGMENT_RE.match(part.removesuffix(".json").removesuffix(".d.ts") or "."):
+            raise SystemExit(f"error: refusing to write unsafe path segment {part!r}")
+        if sys.platform == "win32" and _WINDOWS_UNSAFE.search(part):
+            raise SystemExit(f"error: {part!r} can't be a file name on Windows")
+        dest = dest / part
+        if dest.is_symlink():
+            raise SystemExit(f"error: {dest} is a symlink; refusing to write through it")
+    if not dest.resolve().is_relative_to(root.resolve()):
+        raise SystemExit(f"error: refusing to write {dest} outside {root}")
+    return dest
+
+
+def _save_docs(out_dir: str, collection: str, docs: list[dict]) -> None:
+    """Each document as <out_dir>/<collection>/<id>.json; prints the paths."""
+    root = Path(out_dir)
+    for doc in docs:
+        doc_id = str(doc.get("id", ""))
+        dest = _safe_dest(root, [*collection.split("/"), f"{doc_id}.json"])
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(
+            json.dumps(doc.get("data"), indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        print(dest)
+
+
+def _db_profiles(client: api.FrameClient, slug: str, args) -> int:
+    ids = list(dict.fromkeys(args.id))
+    if not 1 <= len(ids) <= 64:
+        raise SystemExit("error: name 1-64 people at a time")
+    for person in ids:
+        if not _PERSON_RE.match(person):
+            raise SystemExit(f"error: {person!r} is not a person id (u_ and 22 characters)")
+    try:
+        profiles = client.profiles(slug, ids)
+    except api.ApiError as exc:
+        if api.error_code(exc.body) == "not_declared" or (
+            isinstance(exc.body, dict) and exc.body.get("error") == "not_declared"
+        ):
+            raise api.ApiError(
+                "this artifact's published version doesn't declare the user capability - "
+                "republish it with --capability user",
+                exc.status,
+                exc.body,
+            ) from None
+        raise
+    if args.json:
+        _print_json(profiles)
+        return 0
+    for person in ids:
+        info = profiles.get(person) or {}
+        name = info.get("name") or "(unknown)"
+        print(f"{person}\t{name}" + ("\tguest" if info.get("guest") else ""))
+    return 0
+
+
 def cmd_db(args) -> int:
     slug = api.slug_from(args.slug)
-    db = _Db(_client(args), slug)
+    client = _client(args)
     verb = args.db_command
+
+    if verb == "profiles":
+        return _db_profiles(client, slug, args)
+
+    db = _Db(
+        client,
+        slug,
+        as_level=getattr(args, "as_level", None),
+        require_version=getattr(args, "require_version", False),
+    )
 
     if verb == "whoami":
         data = db.call("whoami", {})
         print(data.get("id", ""))
         return 0
 
+    out_dir = getattr(args, "out_dir", None)
+    if out_dir and args.json:
+        raise SystemExit("error: --out-dir saves the documents; it doesn't combine with --json")
+
     if verb == "get":
-        data = db.call("get", {"path": db.path(args.collection, args.doc)})
+        collection = db.collection(args.collection)
+        data = db.call("get", {"path": f"{collection}/{_doc_id(args.doc)}"})
         if args.json:
             _print_json(_strip_meta(data))
-        elif not data.get("exists"):
+            return 0
+        if not data.get("exists"):
             _eprint("  no such document")
             return 1
+        if out_dir:
+            _save_docs(out_dir, collection, [{"id": args.doc, "data": data.get("data")}])
+            _eprint(f"  version {data.get('version')}")
         else:
             _print_json(data.get("data"))
             _eprint(f"  version {data.get('version')}  updated {data.get('updatedAt')}")
@@ -481,14 +630,16 @@ def cmd_db(args) -> int:
             if not (args.all and cursor):
                 break
             query["cursor"] = cursor
-        if args.json:
+        if out_dir:
+            _save_docs(out_dir, query["collection"], docs)
+        elif args.json:
             _print_json({"docs": docs, **({"nextCursor": cursor} if cursor else {})})
         else:
             for doc in docs:
                 body = json.dumps(doc.get("data"), ensure_ascii=False)
                 print(f"{doc.get('id')}\tv{doc.get('version')}\t{body}")
-            if cursor:
-                _eprint(f"  more: --cursor {cursor}  (or --all)")
+        if cursor and not args.json:
+            _eprint(f"  more: --cursor {cursor}  (or --all)")
         return 0
 
     if verb in ("set", "update", "delete", "edit"):
@@ -716,7 +867,7 @@ def cmd_types(args) -> int:
     action = args.types_command
 
     if action == "list":
-        types = client.types()
+        types = client.types(getattr(args, "query", None))
         if args.json:
             _print_json(types)
             return 0
@@ -756,7 +907,7 @@ def cmd_types(args) -> int:
         return 0
 
     if action == "instances":
-        rows = client.type_instances(slug, limit=args.limit)
+        rows = client.type_instances(slug, limit=args.limit, rel=args.scope)
         if args.json:
             _print_json(rows)
             return 0
@@ -790,8 +941,34 @@ def cmd_create(args) -> int:
 def cmd_contract(args) -> int:
     client = _client(args)
     data = client.contract(args.version)
+    version = data.get("version") or args.version
+    if args.out_dir and args.defs is None:
+        raise SystemExit("error: --out-dir goes with --defs")
+    if args.defs is not None:
+        if not re.fullmatch(r"[0-9]{1,4}\.[0-9]{1,5}\.[0-9]{1,6}", str(version)):
+            raise api.ApiError(f"the contract came back with an unusable version {version!r}")
+        if args.prompt or args.json:
+            raise SystemExit("error: --defs prints TypeScript; it doesn't combine with --prompt or --json")
+        known = list(data.get("capabilities") or [])
+        names = args.defs or (["claude"] if data.get("claude") else []) + known
+        unknown = [n for n in names if n != "claude" and n not in known]
+        if unknown:
+            raise SystemExit(
+                f"error: contract {version} has no capability {', '.join(unknown)}; "
+                f"it supports: {', '.join(known) or '(none)'}"
+            )
+        for name in dict.fromkeys(names):
+            defs = client.contract_defs(version, name)
+            if args.out_dir:
+                dest = _safe_dest(Path(args.out_dir), [version, f"{name}.d.ts"])
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(defs, encoding="utf-8")
+                print(dest)
+            else:
+                sys.stdout.write(f"// ---- {version}/{name}.d.ts\n{defs.rstrip()}\n\n")
+        return 0
     if args.prompt:
-        sys.stdout.write(client.contract_prompt(data.get("version") or args.version))
+        sys.stdout.write(client.contract_prompt(version))
     elif args.json:
         _print_json(data)
     else:

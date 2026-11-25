@@ -62,6 +62,61 @@ def _load_assets(specs: list[str], root: str | None) -> list[api.Asset]:
     return assets
 
 
+def _content_types(specs: list[str] | None) -> dict[str, str]:
+    """--content-type PUB=TYPE flags: published path -> content type."""
+    types = {}
+    for spec in specs or []:
+        path, sep, value = spec.partition("=")
+        value = value.split(";")[0].strip().lower()
+        if not sep or not path or not re.fullmatch(r"[a-z0-9.+-]+/[a-z0-9.+-]+", value):
+            raise SystemExit(f"error: --content-type takes PUB=TYPE, e.g. data.bin=text/plain; got {spec!r}")
+        types[path.lstrip("/")] = value
+    return types
+
+
+def _apply_content_types(assets: list[api.Asset], types: dict[str, str]) -> None:
+    unknown = sorted(set(types) - {a.path for a in assets})
+    if unknown:
+        raise SystemExit(f"error: --content-type names no file being published: {', '.join(unknown)}")
+    for asset in assets:
+        if asset.path in types:
+            asset.content_type = types[asset.path]
+
+
+def _warn_unserved(assets: list[api.Asset]) -> None:
+    """Claude Code refuses to publish types artifacts don't serve; say so here."""
+    for asset in assets:
+        if asset.content_type not in api.SERVED_TYPES:
+            _eprint(
+                f"warning: {asset.path} goes as {asset.content_type}, which artifacts don't "
+                "serve; a page may not be able to load it. A source, config or log file goes "
+                "as text/plain (--content-type PATH=text/plain, or a .txt name)."
+            )
+
+
+def _apply_edits(page: api.Asset, edits: list[list[str]], where: Path) -> api.Asset:
+    """--edit OLD NEW pairs, applied in order; each OLD must occur exactly once."""
+    try:
+        text = page.data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise SystemExit(f"error: --edit needs a UTF-8 page; {where} isn't") from None
+    for i, (old, new) in enumerate(edits, 1):
+        if not old:
+            raise SystemExit(f"error: --edit {i}: the text to replace is empty")
+        first = text.find(old)
+        # A second match may overlap the first ("aa" in "aaa"), which count() misses.
+        count = 0 if first < 0 else 1 + (text.find(old, first + 1) >= 0)
+        if count != 1:
+            shown = old if len(old) <= 60 else old[:57] + "..."
+            raise SystemExit(
+                f"error: --edit {i}: {shown!r} "
+                f"{'is not in' if count == 0 else 'occurs more than once in'} {where} "
+                "(after the edits before it); it must occur exactly once. Nothing was published"
+            )
+        text = text.replace(old, new, 1)
+    return api.Asset(path=page.path, data=text.encode("utf-8"), content_type=page.content_type)
+
+
 def _dir_files(root: Path) -> dict[str, Path]:
     """Published path -> file for everything under root, skipping dotfiles.
 
@@ -308,9 +363,11 @@ def cmd_publish(args) -> int:
             if mode is None and not args.remove:
                 mode = "replace"
             removals = list(args.remove or [])
-        index = files.pop("index.html", None)
-        raw = index.read_bytes() if index else b""
-        page = api.Asset(path="index.html", data=raw, content_type="text/html") if index else None
+        page_file = files.pop("index.html", None)
+        raw = page_file.read_bytes() if page_file else b""
+        page = (
+            api.Asset(path="index.html", data=raw, content_type="text/html") if page_file else None
+        )
         extra = [
             api.Asset(path=pub, data=src.read_bytes(), content_type=api.guess_content_type(pub))
             for pub, src in files.items()
@@ -323,11 +380,20 @@ def cmd_publish(args) -> int:
         if content_type not in ("text/html", "text/markdown"):
             content_type = "text/html"
         page = api.Asset(path="index.html", data=raw, content_type=content_type)
+        page_file = target
         extra = _load_assets(args.file_spec or [], args.root)
         removals = list(args.remove or [])
         fallback_title = target.stem
     else:
         raise SystemExit(f"error: no such file or directory: {target}")
+
+    _apply_content_types(extra, _content_types(args.content_type))
+    _warn_unserved(extra)
+    if args.edit:
+        if page is None or page_file is None:
+            raise SystemExit("error: --edit changes the page, and this publish has none")
+        page = _apply_edits(page, args.edit, page_file)
+        raw = page.data
 
     meta = {}
     if page is None and isinstance(state.get("title"), str):
@@ -371,6 +437,18 @@ def cmd_publish(args) -> int:
     )
     url = api.ARTIFACT_URL.format(slug=result["slug"])
 
+    if args.edit:
+        # Published with the edits; the file keeps them so it stays the source.
+        try:
+            page_file.write_bytes(page.data)
+        except OSError as exc:
+            _eprint(f"warning: published, but saving the edits to {page_file} failed: {exc}")
+    if args.pin:
+        try:
+            client.pin(result["slug"], True)
+        except api.ApiError as exc:
+            _eprint(f"warning: published, but pinning failed: {exc}")
+
     if state_root is not None:
         new_state = {
             "slug": result["slug"],
@@ -392,29 +470,70 @@ def cmd_publish(args) -> int:
     return 0
 
 
-def cmd_list(args) -> int:
-    frames = _client(args).list_frames(limit=args.limit)
+def _wanted(row: dict, args) -> bool:
+    """The `list` filters. rel=favorited serves browser sessions only, so pins are here."""
+    if row.get("softDeleted") or row.get("soft_deleted"):
+        return False
+    if args.pinned and not row.get("starred"):
+        return False
+    if args.type:
+        wanted = args.type.strip().lower()
+        kind = (row.get("type_title") or "").lower()
+        return kind == wanted or (wanted == "page" and not kind)
+    return True
 
-    if args.scope != "all":
-        want = "mine" if args.scope == "mine" else "shared"
-        frames = [f for f in frames if (f.get("rel") or "mine") == want]
-    frames = [f for f in frames if not f.get("softDeleted")]
-    if args.pinned:
-        frames = [f for f in frames if f.get("starred")]
+
+def _list_rows(client: api.FrameClient, args) -> tuple[list[dict], str | None, bool]:
+    """(rows, next page token, cut short by --limit) for `list`.
+
+    From the paged gallery, filtered page by page so --limit counts printed rows;
+    the unpaged listing if the gallery isn't served.
+    """
+    filtering = bool(args.pinned or args.type)
+    rows: list[dict] = []
+    token = args.page_token
+    seen: set[str] = set()
+    try:
+        while len(rows) < args.limit:
+            size = 200 if filtering else min(200, args.limit - len(rows))
+            page, token = client.list_artifacts(args.scope, size, token)
+            rows.extend(f for f in page if _wanted(f, args))
+            if not token or len(rows) >= args.limit:
+                break
+            if token in seen:
+                raise api.ApiError("the listing repeated a page token; stopping")
+            seen.add(token)
+    except api.ApiError as exc:
+        if exc.status not in (400, 403, 404) or args.page_token or rows:
+            raise
+        rows, token = client.list_frames(limit=args.limit), None
+        if args.scope != "all":
+            rows = [f for f in rows if (f.get("rel") or "mine") == args.scope]
+        rows = [f for f in rows if _wanted(f, args)]
+    if len(rows) > args.limit:
+        # The rest of this page isn't reachable through the token: say so instead.
+        return rows[: args.limit], None, True
+    return rows, token, False
+
+
+def cmd_list(args) -> int:
+    frames, token, cut = _list_rows(_client(args), args)
 
     if args.json:
         print(json.dumps(frames, indent=2))
-        return 0
-
-    if not frames:
-        print("No artifacts.")
-        return 0
-
-    for f in frames:
-        slug = f.get("slug", "?")
-        title = (f.get("title") or "(untitled)").strip()
-        updated = (f.get("updatedAt") or "")[:10]
-        print(f"{slug:<38} {updated:<11} {title}")
+    else:
+        if not frames:
+            print("No artifacts.")
+        for f in frames:
+            slug = f.get("slug", "?")
+            title = (f.get("title") or "(untitled)").strip()
+            updated = (f.get("updatedAt") or "")[:10]
+            kind = f.get("type_title") or ""
+            print(f"{slug:<38} {updated:<11} {kind:<10} {title}".rstrip())
+    if token:
+        _eprint(f"  more: --page-token {token}")
+    elif cut:
+        _eprint(f"  more: raise --limit (now {args.limit})")
     return 0
 
 
@@ -766,6 +885,21 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("SOURCE", "PUB[=SRC]"),
         help="have the server copy a published file from another artifact; repeatable",
     )
+    p.add_argument(
+        "--content-type",
+        action="append",
+        metavar="PUB=TYPE",
+        help="content type for a supporting file the extension doesn't give; repeatable",
+    )
+    p.add_argument(
+        "--edit",
+        nargs=2,
+        action="append",
+        metavar=("OLD", "NEW"),
+        help="replace OLD (which must occur exactly once) with NEW in the page before "
+        "publishing, and save the page with the change; repeatable, applied in order",
+    )
+    p.add_argument("--pin", action="store_true", help="pin the artifact once it is published")
     p.add_argument("--note", help="note recorded with this version")
     p.add_argument("--thumbnail", metavar="IMAGE", help="gallery thumbnail image")
     p.add_argument("--thumbnail-dark", metavar="IMAGE", help="dark-mode gallery thumbnail")
@@ -773,9 +907,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_publish)
 
     p = sub.add_parser("list", parents=[common], help="list your artifacts")
-    p.add_argument("--limit", type=int, default=200)
+    p.add_argument("--limit", type=int, default=200, help="most rows to print (default 200)")
     p.add_argument("--scope", choices=["mine", "shared", "all"], default="mine")
     p.add_argument("--pinned", action="store_true", help="only pinned artifacts")
+    p.add_argument(
+        "--type",
+        metavar="TITLE",
+        help="only artifacts made from this type (Docs, Slides, ...), or 'page' for plain pages",
+    )
+    p.add_argument("--page-token", help="continue a listing that printed `more: --page-token`")
     p.set_defaults(func=cmd_list)
 
     p = sub.add_parser("read", parents=[common], help="metadata, manifest, or a file's bytes")
@@ -838,6 +978,7 @@ def _add_more(sub, common) -> None:
     which.add_argument(
         "--awaiting", action="store_true", help="only threads waiting on a reply from Claude"
     )
+    which.add_argument("--thread", metavar="ID", help="only this thread")
     c.add_argument("--full", action="store_true", help="don't shorten comment text")
     c.set_defaults(func=commands.cmd_comments_list)
     c = csub.add_parser(
@@ -849,6 +990,11 @@ def _add_more(sub, common) -> None:
     c.add_argument(
         "--id", help="client id (UUID) making a retry idempotent (default: a fresh one)"
     )
+    c.add_argument(
+        "--allow-duplicate",
+        action="store_true",
+        help="post even though a Claude reply already answers every request on the thread",
+    )
     c.set_defaults(func=commands.cmd_comments_reply)
     c = csub.add_parser("resolve", parents=[common], help="resolve threads sent to Claude")
     slug_arg(c)
@@ -859,6 +1005,22 @@ def _add_more(sub, common) -> None:
     p = sub.add_parser("db", help="read and write an artifact's database")
     dsub = p.add_subparsers(dest="db_command", required=True)
 
+    def as_level(d):
+        d.add_argument(
+            "--as-level",
+            choices=["view", "interact", "admin"],
+            help="act with only this access level, to check what the page's rules allow "
+            "such a viewer (view: shared view-only; interact: any signed-in viewer; admin: "
+            "an editor)",
+        )
+
+    def require_version(d):
+        d.add_argument(
+            "--require-version",
+            action="store_true",
+            help="refuse a write to an existing document that carries no --if-version",
+        )
+
     def db_parser(name, help_text, doc=True):
         d = dsub.add_parser(name, parents=[common], help=help_text)
         slug_arg(d)
@@ -867,12 +1029,17 @@ def _add_more(sub, common) -> None:
         )
         if doc:
             d.add_argument("doc", help="document id")
+        as_level(d)
         d.set_defaults(func=commands.cmd_db)
         return d
 
-    db_parser("get", "one document")
+    d = db_parser("get", "one document")
+    d.add_argument("--out-dir", metavar="DIR", help="save it as DIR/<collection>/<doc>.json")
     for name, help_text in (("list", "documents in a collection"), ("query", "filtered documents")):
         d = db_parser(name, help_text, doc=False)
+        d.add_argument(
+            "--out-dir", metavar="DIR", help="save each as DIR/<collection>/<id>.json"
+        )
         d.add_argument("--limit", type=int)
         d.add_argument("--cursor", help="nextCursor from an earlier page")
         d.add_argument("--all", action="store_true", help="follow every page")
@@ -892,8 +1059,10 @@ def _add_more(sub, common) -> None:
         d = db_parser(name, help_text)
         d.add_argument("--data", help="JSON object, - for stdin, or @FILE")
         d.add_argument("--if-version", type=int, help="refuse unless the document is at this version")
+        require_version(d)
     d = db_parser("delete", "delete a document")
     d.add_argument("--if-version", type=int)
+    require_version(d)
     d = db_parser("edit", "replace text inside one string field")
     d.add_argument("--field", required=True)
     d.add_argument("--old", required=True, help="text to find")
@@ -906,9 +1075,17 @@ def _add_more(sub, common) -> None:
         "writes",
         help="JSON list of {op, collection, doc_id, data?, if_version?}; - for stdin, or @FILE",
     )
+    as_level(d)
+    require_version(d)
     d.set_defaults(func=commands.cmd_db)
     d = dsub.add_parser("whoami", parents=[common], help="your id for data/users/<id>")
     slug_arg(d)
+    d.set_defaults(func=commands.cmd_db)
+    d = dsub.add_parser(
+        "profiles", parents=[common], help="display names for person ids (u_...) in the data"
+    )
+    slug_arg(d)
+    d.add_argument("id", nargs="+", help="person ids, 1-64")
     d.set_defaults(func=commands.cmd_db)
 
     # assets
@@ -937,7 +1114,8 @@ def _add_more(sub, common) -> None:
     # types
     p = sub.add_parser("types", help="Artifact types (Slides, Docs, Dashboard, ...)")
     tsub = p.add_subparsers(dest="types_command", required=True)
-    tsub.add_parser("list", parents=[common], help="types this account can create from")
+    t = tsub.add_parser("list", parents=[common], help="types this account can create from")
+    t.add_argument("--query", "-q", help="only the types that best match this text")
     t = tsub.add_parser("show", parents=[common], help="a type's metadata and files")
     t.add_argument("type", help="type title (e.g. slides), slug or URL")
     t = tsub.add_parser("read", parents=[common], help="a text file the type ships")
@@ -946,6 +1124,7 @@ def _add_more(sub, common) -> None:
     t = tsub.add_parser("instances", parents=[common], help="artifacts made from a type")
     t.add_argument("type", help="type title, slug or URL")
     t.add_argument("--limit", type=int, default=50)
+    t.add_argument("--scope", choices=["mine", "shared", "all"], default="all")
     for t in tsub.choices.values():
         t.set_defaults(func=commands.cmd_types)
 
@@ -961,6 +1140,14 @@ def _add_more(sub, common) -> None:
     p.add_argument(
         "--prompt", action="store_true", help="print the capability guide for page authors"
     )
+    p.add_argument(
+        "--defs",
+        nargs="*",
+        metavar="NAME",
+        help="print the TypeScript definitions (.d.ts) for these capabilities, or for "
+        "claude.use and every capability when no name is given",
+    )
+    p.add_argument("--out-dir", metavar="DIR", help="save --defs as DIR/<version>/<name>.d.ts")
     p.set_defaults(func=commands.cmd_contract)
 
     # sharing and housekeeping

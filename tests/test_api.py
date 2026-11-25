@@ -14,6 +14,11 @@ os.environ.setdefault("CLAUDE_ARTIFACT_NO_UPDATE_CHECK", "1")
 DEPLOY = ("POST", "/api/frame/deploy/direct")
 
 
+def _strip_attempt(path):
+    """Deploys carry ?attempt_id=…; the fakes route on the bare path."""
+    return path.split("?")[0] if path.startswith("/api/frame/deploy/direct?") else path
+
+
 def boot_path(slug):
     return ("GET", f"/api/frame/{slug}?via=model_read")
 
@@ -26,6 +31,7 @@ class Server:
         self.calls = []
 
     def __call__(self, method, path, body=None):
+        path = _strip_attempt(path)
         self.calls.append((method, path, body))
         if (method, path) not in self.routes:
             raise AssertionError(f"unexpected request {method} {path}")

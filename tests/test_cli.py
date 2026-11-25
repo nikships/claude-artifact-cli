@@ -15,6 +15,11 @@ from claude_artifact_cli import api, auth, cli
 os.environ.setdefault("CLAUDE_ARTIFACT_NO_UPDATE_CHECK", "1")
 
 DEPLOY = ("POST", "/api/frame/deploy/direct")
+
+
+def _strip_attempt(path):
+    """Deploys carry ?attempt_id=…; the fakes route on the bare path."""
+    return path.split("?")[0] if path.startswith("/api/frame/deploy/direct?") else path
 URL = "https://claude.ai/code/artifact/{}"
 
 
@@ -34,6 +39,7 @@ class Server:
         self.calls = []
 
     def __call__(self, method, path, body=None):
+        path = _strip_attempt(path)
         self.calls.append((method, path, body))
         if (method, path) not in self.routes:
             raise AssertionError(f"unexpected request {method} {path}")
@@ -148,7 +154,7 @@ class ExitCodeTest(CliCase):
         self.assertIn("claude-artifact pull", err)
 
     def test_api_error_exits_1(self):
-        self.serve({("GET", "/api/frame/frames?limit=200"): api.ApiError("HTTP 500", 500)})
+        self.serve({("GET", "/api/frame/artifacts?rel=mine&kind=page%2Cdocument&sort=last_viewed&limit=200"): api.ApiError("HTTP 500", 500)})
         self.assertEqual(self.run_cli("list")[0], 1)
 
     def test_auth_error_exits_2(self):
@@ -302,14 +308,64 @@ class NoTokenOutputTest(CliCase):
             self.assertIn("__frame_t=[redacted]&w=1", text)
 
     def test_list_json_is_redacted(self):
-        frames = [
-            {"slug": "a", "rel": "mine", "previewToken": "SECRET", "thumb": "x?__frame_t=SECRET"}
+        rows = [
+            {"kind": "page", "id": "a", "rel": "mine", "previewToken": "SECRET",
+             "thumbnail_url": "x?__frame_t=SECRET"}
         ]
-        self.serve({("GET", "/api/frame/frames?limit=200"): {"frames": frames}})
+        self.serve({("GET", "/api/frame/artifacts?rel=mine&kind=page%2Cdocument&sort=last_viewed&limit=200"): {"artifacts": rows}})
         code, out, _ = self.run_cli("--json", "list")
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)[0]["slug"], "a")
         self.assertNotIn("SECRET", out)
+
+    def test_list_follows_pages_and_reports_the_next_token(self):
+        first = "/api/frame/artifacts?rel=mine&kind=page%2Cdocument&sort=last_viewed&limit=3"
+        second = first[: -1] + "2&page_token=T1"
+        self.serve({
+            ("GET", first): {"artifacts": [{"kind": "page", "id": "a", "title": "A"}],
+                            "next_page_token": "T1"},
+            ("GET", second): {"artifacts": [
+                {"kind": "page", "id": "b", "title": "B", "type_title": "Docs"},
+                {"kind": "page", "id": "c", "title": "C"}], "next_page_token": "T2"},
+        })
+        code, out, err = self.run_cli("list", "--limit", "3")
+        self.assertEqual(code, 0)
+        self.assertEqual([line.split()[0] for line in out.splitlines()], ["a", "b", "c"])
+        self.assertIn("Docs", out)
+        self.assertIn("--page-token T2", err)
+
+    def test_list_limit_counts_rows_after_filters(self):
+        base = "/api/frame/artifacts?rel=mine&kind=page%2Cdocument&sort=last_viewed&limit=200"
+        self.serve({
+            ("GET", base): {"artifacts": [
+                {"kind": "page", "id": "a", "title": "A"},
+                {"kind": "page", "id": "b", "title": "B", "starred": True}],
+                "next_page_token": "T1"},
+            ("GET", base + "&page_token=T1"): {"artifacts": [
+                {"kind": "page", "id": "c", "title": "C", "starred": True},
+                {"kind": "page", "id": "d", "title": "D", "starred": True}],
+                "next_page_token": "T1"},
+        })
+        code, out, err = self.run_cli("list", "--pinned", "--limit", "2")
+        self.assertEqual(code, 0)
+        self.assertEqual([line.split()[0] for line in out.splitlines()], ["b", "c"])
+        self.assertIn("raise --limit", err)
+        # A token the server already gave stops the listing instead of looping.
+        code, _, err = self.run_cli("list", "--pinned", "--limit", "5")
+        self.assertEqual(code, 1)
+        self.assertIn("repeated a page token", err)
+
+    def test_list_falls_back_to_the_unpaged_listing(self):
+        self.serve({
+            ("GET", "/api/frame/artifacts?rel=mine&kind=page%2Cdocument&sort=last_viewed&limit=200"): api.ApiError("HTTP 404", 404),
+            ("GET", "/api/frame/frames?limit=200"): {"frames": [
+                {"slug": "a", "rel": "mine", "title": "A"},
+                {"slug": "b", "rel": "shared", "title": "B"}]},
+        })
+        code, out, _ = self.run_cli("list")
+        self.assertEqual(code, 0)
+        self.assertIn("A", out)
+        self.assertNotIn(" B", out)
 
 
 class StatusTest(CliCase):

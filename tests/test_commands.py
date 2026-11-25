@@ -24,6 +24,11 @@ DB = ("POST", "/api/frame/db/agent")
 COMMENTS = ("GET", f"/api/frame/comments/{SLUG}?names=1")
 
 
+def _strip_attempt(path):
+    """Deploys carry ?attempt_id=…; the fakes route on the bare path."""
+    return path.split("?")[0] if path.startswith("/api/frame/deploy/direct?") else path
+
+
 class Server:
     """Stands in for FrameClient._request, keyword arguments included."""
 
@@ -32,6 +37,7 @@ class Server:
         self.calls = []
 
     def __call__(self, method, path, body=None, **kw):
+        path = _strip_attempt(path)
         self.calls.append((method, path, body, kw))
         if (method, path) not in self.routes:
             raise AssertionError(f"unexpected request {method} {path}")
@@ -686,8 +692,10 @@ class HousekeepingTest(Case):
         self.assertNotIn("SECRET", out)
 
     def test_list_pinned(self):
-        self.serve({("GET", "/api/frame/frames?limit=200"): [
-            {"slug": "a", "title": "A", "starred": True}, {"slug": "b", "title": "B"}]})
+        path = "/api/frame/artifacts?rel=mine&kind=page%2Cdocument&sort=last_viewed&limit=200"
+        self.serve({("GET", path): {"artifacts": [
+            {"kind": "page", "id": "a", "title": "A", "rel": "mine", "starred": True},
+            {"kind": "page", "id": "b", "title": "B", "rel": "mine"}]}})
         _, out, _ = self.run_cli("list", "--pinned")
         self.assertIn("A", out)
         self.assertNotIn(" B", out)
